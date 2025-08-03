@@ -1,281 +1,374 @@
-# api-runner/main.py
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-import docker
-import uuid
+"""
+Stock Analyst API Runner
+
+A FastAPI service that manages and runs stock analysis jobs using Docker containers.
+Features:
+- Run stock analysis jobs in Docker containers
+- Real-time streaming of analysis progress
+- Download analysis results (articles, reports)
+- Health monitoring and job management
+"""
+
 import os
-import time
-import pathlib
+import json
+import asyncio
 import logging
-from typing import Dict, Any
+from datetime import datetime
+from typing import Dict, List, Optional
+from pathlib import Path
+import tempfile
+import zipfile
+import shutil
+
+import docker
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, FileResponse
+from pydantic import BaseModel
+import aiofiles
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # If python-dotenv is not installed, we'll just use os.getenv
+    pass
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Stock Analyst Runner", version="1.0.0")
+# Initialize FastAPI app
+app = FastAPI(
+    title="Stock Analyst API Runner",
+    description="API service for running stock analysis jobs in Docker containers",
+    version="1.0.0"
+)
 
-# Add CORS middleware for frontend integration
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this properly for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Docker client
-docker_available = False
-client = None
+# Global variables
+docker_client = None
+jobs: Dict[str, Dict] = {}
 
-try:
-    client = docker.from_env()
-    client.ping()  # Test connection
-    docker_available = True
-    logger.info("Docker client initialized successfully")
-except Exception as e:
-    logger.warning(f"Docker client not available: {e}")
-    logger.warning("Running in Docker-disabled mode - some features won't work")
-    docker_available = False
-
-VOLUME_NAME = os.getenv("DATA_VOLUME", "stockdata")
+# Configuration from environment variables
 BACKEND_IMAGE = os.getenv("BACKEND_IMAGE", "stock-analyst:latest")
-
-# Required API keys for the backend
+DATA_VOLUME = os.getenv("DATA_VOLUME", "stockdata")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Check if required API keys are present
-if not SERPAPI_API_KEY:
-    logger.warning("SERPAPI_API_KEY not set - backend jobs may fail")
-if not OPENAI_API_KEY:
-    logger.warning("OPENAI_API_KEY not set - backend jobs may fail")
-
-class RunRequest(BaseModel):
+# Pydantic models
+class JobRequest(BaseModel):
     ticker: str
-    company: str
-    pipeline: str = "full"
+    company: Optional[str] = None
+    query: Optional[str] = None
+    pipeline: Optional[str] = "full"
+
+class JobResponse(BaseModel):
+    job_id: str
+    status: str
+    message: str
 
 class JobStatus(BaseModel):
     job_id: str
+    ticker: str
+    company: Optional[str] = None
     status: str
-    exit_code: int = None
-    outputs: Dict[str, str] = None
-    logs_tail: str = None
+    progress: Optional[str] = None
+    created_at: str
+    completed_at: Optional[str] = None
+    error: Optional[str] = None
+    container_logs: Optional[str] = None
 
-# In-memory job storage (use Redis or database for production)
-JOBS: Dict[str, Dict[str, Any]] = {}
 
-@app.post("/run")
-def run_analysis(req: RunRequest):
-    """Start a new stock analysis job"""
-    if not docker_available:
-        raise HTTPException(503, "Docker is not available - please run the API runner with Docker access")
+def init_docker_client():
+    """Initialize Docker client with proper error handling"""
+    global docker_client
     
     try:
-        job_id = str(uuid.uuid4())
-        logger.info(f"Starting job {job_id} for ticker {req.ticker}")
+        # Try different connection methods
+        logger.info("Initializing Docker client...")
         
-        # Ensure the data volume exists
+        # Method 1: Default connection
+        docker_client = docker.from_env()
+        docker_client.ping()
+        logger.info("✅ Docker client connected successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to connect to Docker: {e}")
+        docker_client = None
+        return False
+
+
+def ensure_volume_exists():
+    """Ensure the data volume exists"""
+    if not docker_client:
+        return False
+        
+    try:
+        docker_client.volumes.get(DATA_VOLUME)
+        logger.info(f"✅ Volume '{DATA_VOLUME}' exists")
+        return True
+    except docker.errors.NotFound:
         try:
-            client.volumes.get(VOLUME_NAME)
-        except docker.errors.NotFound:
-            logger.info(f"Creating volume {VOLUME_NAME}")
-            client.volumes.create(VOLUME_NAME)
+            docker_client.volumes.create(name=DATA_VOLUME)
+            logger.info(f"✅ Created volume '{DATA_VOLUME}'")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to create volume '{DATA_VOLUME}': {e}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ Error checking volume '{DATA_VOLUME}': {e}")
+        return False
+
+
+async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = None, query: Optional[str] = None, pipeline: str = "full"):
+    """Run stock analysis job in Docker container"""
+    if not docker_client:
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"] = "Docker client not available"
+        return
+    
+    try:
+        jobs[job_id]["status"] = "running"
+        jobs[job_id]["progress"] = "Starting analysis container..."
         
-        container = client.containers.run(
-            image=BACKEND_IMAGE,
-            command=["--ticker", req.ticker, "--company", req.company, "--pipeline", req.pipeline],
-            detach=True,
-            volumes={VOLUME_NAME: {"bind": "/app/data", "mode": "rw"}},
-            working_dir="/app",
-            name=f"stock-analysis-{job_id[:8]}",  # Give container a readable name
-            remove=False,  # Keep container for log inspection
-            environment={
-                "SERPAPI_API_KEY": SERPAPI_API_KEY,
-                "OPENAI_API_KEY": OPENAI_API_KEY,
+        # Prepare environment variables
+        env_vars = {
+            "SERPAPI_API_KEY": SERPAPI_API_KEY,
+            "OPENAI_API_KEY": OPENAI_API_KEY,
+        }
+        
+        # Prepare command - backend requires both ticker and company
+        if not company:
+            # Try to infer company name from common tickers
+            company_map = {
+                "AAPL": "Apple Inc",
+                "GOOGL": "Alphabet Inc",
+                "MSFT": "Microsoft Corporation", 
+                "AMZN": "Amazon.com Inc",
+                "TSLA": "Tesla Inc",
+                "NVDA": "NVIDIA Corporation",
+                "META": "Meta Platforms Inc",
+                "NFLX": "Netflix Inc"
             }
+            company = company_map.get(ticker.upper(), f"{ticker.upper()} Corporation")
+        
+        cmd = ["--ticker", ticker, "--company", company, "--pipeline", pipeline]
+        if query:
+            cmd.extend(["--search-query", query])
+        
+        logger.info(f"🚀 Starting analysis for {ticker} ({company}) with command: {cmd}")
+        jobs[job_id]["progress"] = f"Running {pipeline} analysis for {ticker} ({company})..."
+        
+        # Run container
+        container = docker_client.containers.run(
+            BACKEND_IMAGE,
+            command=cmd,
+            environment=env_vars,
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
+            detach=True,
+            remove=False,  # Don't auto-remove so we can get logs
+            name=f"analysis-{job_id}"
         )
         
-        JOBS[job_id] = {
-            "container_id": container.id,
-            "ticker": req.ticker.upper(),
-            "company": req.company,
-            "pipeline": req.pipeline,
-            "created_at": time.time()
-        }
+        jobs[job_id]["container_id"] = container.id
+        jobs[job_id]["progress"] = "Analysis running..."
         
-        logger.info(f"Job {job_id} started with container {container.id}")
-        return {"job_id": job_id, "status": "started"}
+        # Wait for container to complete
+        result = container.wait()
         
-    except docker.errors.ImageNotFound:
-        logger.error(f"Docker image {BACKEND_IMAGE} not found")
-        raise HTTPException(404, f"Backend image {BACKEND_IMAGE} not found")
-    except docker.errors.APIError as e:
-        logger.error(f"Docker API error: {e}")
-        raise HTTPException(500, f"Docker error: {str(e)}")
+        # Get container logs for debugging
+        logs = container.logs().decode('utf-8')
+        jobs[job_id]["container_logs"] = logs[-2000:]  # Keep last 2000 chars
+        
+        if result["StatusCode"] == 0:
+            jobs[job_id]["status"] = "completed"
+            jobs[job_id]["progress"] = "Analysis completed successfully"
+            jobs[job_id]["completed_at"] = datetime.now().isoformat()
+            logger.info(f"✅ Analysis job {job_id} completed successfully")
+        else:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = f"Container exited with code {result['StatusCode']}"
+            logger.error(f"❌ Analysis job {job_id} failed with exit code {result['StatusCode']}")
+            logger.error(f"Container logs: {logs[-500:]}")  # Log last 500 chars
+            
+        # Clean up container
+        try:
+            container.remove()
+        except Exception as e:
+            logger.warning(f"Failed to remove container: {e}")
+            
     except Exception as e:
-        logger.error(f"Unexpected error starting job: {e}")
-        raise HTTPException(500, f"Failed to start job: {str(e)}")
+        logger.error(f"❌ Error in analysis job {job_id}: {e}")
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"] = str(e)
 
-@app.get("/jobs/{job_id}")
-def get_job_status(job_id: str):
-    """Get job status and results"""
-    if not docker_available:
-        raise HTTPException(503, "Docker is not available")
-        
-    info = JOBS.get(job_id)
-    if not info:
-        raise HTTPException(404, "Job not found")
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup"""
+    logger.info("🚀 Starting Stock Analyst API Runner...")
     
-    try:
-        container = client.containers.get(info["container_id"])
-        status = container.status
-        exit_code = container.attrs["State"].get("ExitCode")
-        
-        result = {
-            "job_id": job_id,
-            "status": status,
-            "exit_code": exit_code,
-            "ticker": info["ticker"],
-            "company": info["company"],
-            "pipeline": info["pipeline"]
-        }
-        
-        # Add outputs and logs if job is finished
-        if status == "exited":
-            result["logs_tail"] = container.logs(tail=200).decode(errors="ignore")
-            result["outputs"] = get_job_outputs(job_id, info["ticker"])
-        
-        return result
-        
-    except docker.errors.NotFound:
-        logger.error(f"Container for job {job_id} not found")
-        raise HTTPException(404, "Job container not found")
-    except Exception as e:
-        logger.error(f"Error getting job status: {e}")
-        raise HTTPException(500, f"Failed to get job status: {str(e)}")
-
-def get_job_outputs(job_id: str, ticker: str) -> Dict[str, str]:
-    """Get list of output files for a job using a temporary container"""
-    try:
-        # Use a temporary container to list files in the volume
-        temp_container = client.containers.run(
-            image="alpine:latest",
-            command=["find", f"/data/{ticker}", "-type", "f", "-exec", "basename", "{}", ";"],
-            volumes={VOLUME_NAME: {"bind": "/data", "mode": "ro"}},
-            remove=True,
-            detach=False
-        )
-        
-        output = temp_container.decode().strip()
-        if output:
-            files = {}
-            for filename in output.split('\n'):
-                if filename:
-                    files[filename] = f"/jobs/{job_id}/files/{filename}"
-            return files
-        return {}
-        
-    except Exception as e:
-        logger.error(f"Error getting outputs for job {job_id}: {e}")
-        return {}
-
-@app.get("/jobs/{job_id}/logs")
-def get_job_logs(job_id: str, tail: int = 1000):
-    """Get full job logs"""
-    info = JOBS.get(job_id)
-    if not info:
-        raise HTTPException(404, "Job not found")
+    # Initialize Docker
+    docker_ready = init_docker_client()
+    if not docker_ready:
+        logger.warning("⚠️ Docker not available - running in limited mode")
+    else:
+        # Ensure volume exists
+        ensure_volume_exists()
     
-    try:
-        container = client.containers.get(info["container_id"])
-        logs = container.logs(tail=tail).decode(errors="ignore")
-        return {"job_id": job_id, "logs": logs}
-    except docker.errors.NotFound:
-        raise HTTPException(404, "Job container not found")
-    except Exception as e:
-        logger.error(f"Error getting logs for job {job_id}: {e}")
-        raise HTTPException(500, f"Failed to get logs: {str(e)}")
-
-@app.get("/jobs/{job_id}/files/{filename}")
-def download_file(job_id: str, filename: str):
-    """Download an output file from a job"""
-    info = JOBS.get(job_id)
-    if not info:
-        raise HTTPException(404, "Job not found")
+    # Check API keys
+    if not SERPAPI_API_KEY:
+        logger.warning("⚠️ SERPAPI_API_KEY not set")
+    else:
+        logger.info("✅ SERPAPI_API_KEY configured")
+    if not OPENAI_API_KEY:
+        logger.warning("⚠️ OPENAI_API_KEY not set")  
+    else:
+        logger.info("✅ OPENAI_API_KEY configured")
     
-    try:
-        # Use a temporary container to copy the file out
-        temp_container = client.containers.create(
-            image="alpine:latest",
-            command=["cat", f"/data/{info['ticker']}/{filename}"],
-            volumes={VOLUME_NAME: {"bind": "/data", "mode": "ro"}}
-        )
-        
-        temp_container.start()
-        temp_container.wait()
-        
-        # Get the file content
-        file_content = temp_container.logs()
-        temp_container.remove()
-        
-        # Create a temporary file to serve
-        temp_path = f"/tmp/{job_id}_{filename}"
-        with open(temp_path, "wb") as f:
-            f.write(file_content)
-        
-        return FileResponse(
-            temp_path,
-            filename=filename,
-            media_type="application/octet-stream"
-        )
-        
-    except Exception as e:
-        logger.error(f"Error downloading file {filename} for job {job_id}: {e}")
-        raise HTTPException(500, f"Failed to download file: {str(e)}")
+    logger.info("✅ API Runner started successfully")
+
 
 @app.get("/")
-def root():
+async def root():
     """Health check endpoint"""
     return {
-        "service": "Stock Analyst Runner",
         "status": "healthy",
-        "version": "1.0.0",
-        "docker_available": docker_available,
+        "service": "Stock Analyst API Runner",
+        "docker_available": docker_client is not None,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Detailed health check"""
+    docker_status = "connected" if docker_client else "disconnected"
+    
+    return {
+        "status": "healthy",
+        "docker": docker_status,
+        "backend_image": BACKEND_IMAGE,
+        "data_volume": DATA_VOLUME,
         "api_keys_configured": {
             "serpapi": bool(SERPAPI_API_KEY),
             "openai": bool(OPENAI_API_KEY)
         }
     }
 
-@app.get("/jobs")
-def list_jobs():
-    """List all jobs"""
-    jobs = []
-    for job_id, info in JOBS.items():
-        try:
-            container = client.containers.get(info["container_id"])
-            jobs.append({
-                "job_id": job_id,
-                "ticker": info["ticker"],
-                "company": info["company"],
-                "status": container.status,
-                "created_at": info.get("created_at")
-            })
-        except docker.errors.NotFound:
-            # Container was removed
-            jobs.append({
-                "job_id": job_id,
-                "ticker": info["ticker"],
-                "company": info["company"],
-                "status": "removed",
-                "created_at": info.get("created_at")
-            })
+
+@app.post("/run", response_model=JobResponse)
+async def start_analysis(request: JobRequest, background_tasks: BackgroundTasks):
+    """Start a new stock analysis job"""
+    if not docker_client:
+        raise HTTPException(status_code=503, detail="Docker service not available")
     
-    return {"jobs": jobs}
+    if not SERPAPI_API_KEY or not OPENAI_API_KEY:
+        raise HTTPException(status_code=400, detail="API keys not configured")
+    
+    # Generate job ID
+    job_id = f"{request.ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Create job record
+    jobs[job_id] = {
+        "job_id": job_id,
+        "ticker": request.ticker,
+        "company": request.company,
+        "status": "pending",
+        "created_at": datetime.now().isoformat(),
+        "progress": "Job queued"
+    }
+    
+    # Start background task
+    background_tasks.add_task(run_analysis_job, job_id, request.ticker, request.company, request.query, request.pipeline)
+    
+    return JobResponse(
+        job_id=job_id,
+        status="pending",
+        message="Analysis job started"
+    )
+
+
+@app.get("/jobs/{job_id}", response_model=JobStatus)
+async def get_job_status(job_id: str):
+    """Get status of a specific job"""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    return JobStatus(**job)
+
+
+@app.get("/jobs")
+async def list_jobs():
+    """List all jobs"""
+    return {"jobs": list(jobs.values())}
+
+
+@app.get("/jobs/{job_id}/logs")
+async def get_job_logs(job_id: str):
+    """Get detailed job logs for debugging"""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    
+    return {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "progress": job.get("progress"),
+        "error": job.get("error"),
+        "container_logs": job.get("container_logs", "No logs available"),
+        "container_id": job.get("container_id")
+    }
+
+
+@app.get("/jobs/{job_id}/logs/stream")
+async def get_job_logs_stream(job_id: str):
+    """Stream job logs in real-time"""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    async def log_generator():
+        # This would stream logs from the container or log files
+        # For now, return job progress updates
+        job = jobs[job_id]
+        yield f"data: {json.dumps({'message': job.get('progress', 'No progress info')})}\n\n"
+        
+        if job['status'] == 'failed' and 'error' in job:
+            yield f"data: {json.dumps({'error': job['error']})}\n\n"
+            
+        if 'container_logs' in job:
+            yield f"data: {json.dumps({'container_logs': job['container_logs']})}\n\n"
+    
+    return StreamingResponse(log_generator(), media_type="text/plain")
+
+
+@app.get("/jobs/{job_id}/files/{filename}")
+async def download_file(job_id: str, filename: str):
+    """Download a specific file from job results"""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    if job['status'] != 'completed':
+        raise HTTPException(status_code=400, detail="Job not completed")
+    
+    # This would need to be implemented based on how files are stored
+    # in the Docker volume. For now, return a placeholder.
+    raise HTTPException(status_code=501, detail="File download not yet implemented")
+
 
 if __name__ == "__main__":
     import uvicorn

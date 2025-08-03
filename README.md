@@ -50,11 +50,11 @@ cp .env.example .env
 # Edit .env file
 
 # Then build and run
-docker build -t api-runner .
+docker build -t stock-analyst-runner .
 docker run -p 8080:8080 \
   -v /var/run/docker.sock:/var/run/docker.sock \
   --env-file .env \
-  api-runner
+  stock-analyst-runner
 ```
 
 ### Docker Compose (Recommended)

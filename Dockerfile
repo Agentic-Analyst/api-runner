@@ -1,27 +1,30 @@
-FROM python:3.11-slim
+FROM mirror.gcr.io/debian:bookworm-slim
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Install Python + venv + certs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create and activate a virtualenv
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
 
-# Copy requirements and install Python dependencies
+# Copy requirements first for better caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Install all dependencies from requirements.txt
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt
+
+# Copy your runner code
 COPY main.py .
 
-# Create non-root user for security
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-USER appuser
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/ || exit 1
-
 EXPOSE 8080
-
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
