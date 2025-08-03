@@ -184,8 +184,28 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = No
         jobs[job_id]["container_id"] = container.id
         jobs[job_id]["progress"] = "Analysis running..."
         
-        # Wait for container to complete
-        result = container.wait()
+        # Wait for container to complete with timeout
+        try:
+            # Use asyncio to run the blocking wait() call in a thread pool
+            import concurrent.futures
+            
+            def wait_for_container():
+                return container.wait(timeout=1800)  # 30 minute timeout
+            
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                result = await loop.run_in_executor(executor, wait_for_container)
+                
+        except Exception as e:
+            logger.error(f"Container wait timeout or error: {e}")
+            # Kill the container if it's taking too long
+            try:
+                container.kill()
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["error"] = f"Analysis timeout: {str(e)}"
+                return
+            except Exception as kill_e:
+                logger.error(f"Failed to kill container: {kill_e}")
         
         # Get container logs for debugging
         logs = container.logs().decode('utf-8')
