@@ -135,46 +135,114 @@ def ensure_volume_exists():
 
 
 async def monitor_container_logs(job_id: str, container):
-    """Monitor container logs in real-time and update job progress"""
+    """Monitor container logs AND info.log file in real-time and update job progress"""
     try:
+        def get_logs():
+            try:
+                # Monitor both container logs and info.log file
+                import time
+                import os
+                last_info_log_size = 0
+                
+                # Get container logs in background
+                log_iter = container.logs(stream=True, follow=True, stdout=True, stderr=True)
+                
+                while True:
+                    if job_id not in jobs:
+                        break
+                    
+                    try:
+                        # Try to get next log line with timeout
+                        log_line = next(log_iter, None)
+                        if log_line:
+                            log_text = log_line.decode('utf-8').strip()
+                            if log_text:
+                                # Update job with latest container log
+                                jobs[job_id]["latest_log"] = log_text
+                                jobs[job_id]["last_activity"] = datetime.now().isoformat()
+                                
+                                # Store recent logs (keep last 50 lines)
+                                if "recent_logs" not in jobs[job_id]:
+                                    jobs[job_id]["recent_logs"] = []
+                                jobs[job_id]["recent_logs"].append(f"[CONTAINER] {log_text}")
+                                if len(jobs[job_id]["recent_logs"]) > 50:
+                                    jobs[job_id]["recent_logs"].pop(0)
+                        
+                        # Also check info.log file for updates
+                        ticker = jobs[job_id].get('ticker', '').upper()
+                        try:
+                            # Use a temporary container to check info.log size and tail new content
+                            temp_container = docker_client.containers.run(
+                                "alpine:latest",
+                                command=f"sh -c 'if [ -f /data/{ticker}/info.log ]; then wc -c /data/{ticker}/info.log | cut -d\" \" -f1; else echo 0; fi'",
+                                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                                remove=True,
+                                detach=False
+                            )
+                            current_size = int(temp_container.decode('utf-8').strip())
+                            
+                            if current_size > last_info_log_size:
+                                # Get new content from info.log
+                                temp_container2 = docker_client.containers.run(
+                                    "alpine:latest",
+                                    command=f"sh -c 'if [ -f /data/{ticker}/info.log ]; then tail -c +{last_info_log_size + 1} /data/{ticker}/info.log; fi'",
+                                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                                    remove=True,
+                                    detach=False
+                                )
+                                new_content = temp_container2.decode('utf-8').strip()
+                                
+                                if new_content:
+                                    # Split into lines and process each
+                                    for line in new_content.split('\n'):
+                                        if line.strip():
+                                            jobs[job_id]["latest_log"] = f"[INFO.LOG] {line.strip()}"
+                                            jobs[job_id]["last_activity"] = datetime.now().isoformat()
+                                            
+                                            # Parse info.log for specific progress updates
+                                            if "Pipeline initialized" in line:
+                                                jobs[job_id]["progress"] = "Pipeline initialized"
+                                            elif "Stock Analysis Pipeline Session Started" in line:
+                                                jobs[job_id]["progress"] = "Analysis session started"
+                                            elif "ERROR" in line:
+                                                jobs[job_id]["progress"] = f"Error detected: {line.split('|')[-1].strip()}"
+                                            elif "No filtered articles found" in line:
+                                                jobs[job_id]["progress"] = "No articles found for screening"
+                                            elif "completed" in line.lower():
+                                                jobs[job_id]["progress"] = "Analysis completed"
+                                            
+                                            # Store recent logs from info.log
+                                            if "recent_logs" not in jobs[job_id]:
+                                                jobs[job_id]["recent_logs"] = []
+                                            jobs[job_id]["recent_logs"].append(f"[INFO.LOG] {line.strip()}")
+                                            if len(jobs[job_id]["recent_logs"]) > 50:
+                                                jobs[job_id]["recent_logs"].pop(0)
+                                
+                                last_info_log_size = current_size
+                        
+                        except Exception as info_log_error:
+                            # Info.log might not exist yet, that's OK
+                            pass
+                        
+                        # Small delay to avoid overwhelming the system
+                        time.sleep(2)
+                        
+                    except StopIteration:
+                        # Container logs ended
+                        break
+                    except Exception as e:
+                        logger.error(f"Error processing logs for job {job_id}: {e}")
+                        time.sleep(5)  # Wait longer on error
+                        
+            except Exception as e:
+                logger.error(f"Error in log streaming for job {job_id}: {e}")
+        
+        # Run log monitoring in thread pool to avoid blocking
         import concurrent.futures
         loop = asyncio.get_event_loop()
         
-        def get_log_stream():
-            return container.logs(stream=True, follow=True)
-        
-        # Get the log stream in an executor to avoid blocking
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            log_stream = await loop.run_in_executor(executor, get_log_stream)
-            
-            for log_line in log_stream:
-                if job_id not in jobs:
-                    break
-                    
-                log_text = log_line.decode('utf-8').strip()
-                if not log_text:
-                    continue
-                    
-                # Update job with latest log line
-                jobs[job_id]["latest_log"] = log_text
-                jobs[job_id]["last_activity"] = datetime.now().isoformat()
-                
-                # Parse log for progress updates
-                if "Pipeline initialized" in log_text:
-                    jobs[job_id]["progress"] = "Pipeline initialized"
-                elif "Stock Analysis Pipeline Session Started" in log_text:
-                    jobs[job_id]["progress"] = "Analysis session started"
-                elif "ERROR" in log_text:
-                    jobs[job_id]["progress"] = f"Error detected: {log_text.split('|')[-1].strip()}"
-                elif "completed" in log_text.lower():
-                    jobs[job_id]["progress"] = "Analysis completed"
-                    
-                # Store recent logs (keep last 50 lines)
-                if "recent_logs" not in jobs[job_id]:
-                    jobs[job_id]["recent_logs"] = []
-                jobs[job_id]["recent_logs"].append(log_text)
-                if len(jobs[job_id]["recent_logs"]) > 50:
-                    jobs[job_id]["recent_logs"].pop(0)
+            await loop.run_in_executor(executor, get_logs)
                     
     except Exception as e:
         logger.error(f"Error monitoring logs for job {job_id}: {e}")
