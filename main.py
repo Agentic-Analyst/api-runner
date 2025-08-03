@@ -87,6 +87,9 @@ class JobStatus(BaseModel):
     completed_at: Optional[str] = None
     error: Optional[str] = None
     container_logs: Optional[str] = None
+    latest_log: Optional[str] = None
+    last_activity: Optional[str] = None
+    recent_logs: Optional[List[str]] = None
 
 
 def init_docker_client():
@@ -131,8 +134,54 @@ def ensure_volume_exists():
         return False
 
 
+async def monitor_container_logs(job_id: str, container):
+    """Monitor container logs in real-time and update job progress"""
+    try:
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        
+        def get_log_stream():
+            return container.logs(stream=True, follow=True)
+        
+        # Get the log stream in an executor to avoid blocking
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            log_stream = await loop.run_in_executor(executor, get_log_stream)
+            
+            for log_line in log_stream:
+                if job_id not in jobs:
+                    break
+                    
+                log_text = log_line.decode('utf-8').strip()
+                if not log_text:
+                    continue
+                    
+                # Update job with latest log line
+                jobs[job_id]["latest_log"] = log_text
+                jobs[job_id]["last_activity"] = datetime.now().isoformat()
+                
+                # Parse log for progress updates
+                if "Pipeline initialized" in log_text:
+                    jobs[job_id]["progress"] = "Pipeline initialized"
+                elif "Stock Analysis Pipeline Session Started" in log_text:
+                    jobs[job_id]["progress"] = "Analysis session started"
+                elif "ERROR" in log_text:
+                    jobs[job_id]["progress"] = f"Error detected: {log_text.split('|')[-1].strip()}"
+                elif "completed" in log_text.lower():
+                    jobs[job_id]["progress"] = "Analysis completed"
+                    
+                # Store recent logs (keep last 50 lines)
+                if "recent_logs" not in jobs[job_id]:
+                    jobs[job_id]["recent_logs"] = []
+                jobs[job_id]["recent_logs"].append(log_text)
+                if len(jobs[job_id]["recent_logs"]) > 50:
+                    jobs[job_id]["recent_logs"].pop(0)
+                    
+    except Exception as e:
+        logger.error(f"Error monitoring logs for job {job_id}: {e}")
+
+
 async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = None, query: Optional[str] = None, pipeline: str = "full"):
-    """Run stock analysis job in Docker container"""
+    """Run stock analysis job in Docker container with real-time monitoring"""
     if not docker_client:
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = "Docker client not available"
@@ -141,6 +190,7 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = No
     try:
         jobs[job_id]["status"] = "running"
         jobs[job_id]["progress"] = "Starting analysis container..."
+        jobs[job_id]["recent_logs"] = []
         
         # Prepare environment variables
         env_vars = {
@@ -184,15 +234,18 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = No
         jobs[job_id]["container_id"] = container.id
         jobs[job_id]["progress"] = "Analysis running..."
         
+        # Start log monitoring in background
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        
+        # Monitor logs in a separate task
+        log_task = asyncio.create_task(monitor_container_logs(job_id, container))
+        
         # Wait for container to complete with timeout
         try:
-            # Use asyncio to run the blocking wait() call in a thread pool
-            import concurrent.futures
-            
             def wait_for_container():
                 return container.wait(timeout=1800)  # 30 minute timeout
             
-            loop = asyncio.get_event_loop()
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 result = await loop.run_in_executor(executor, wait_for_container)
                 
@@ -203,23 +256,35 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = No
                 container.kill()
                 jobs[job_id]["status"] = "failed"
                 jobs[job_id]["error"] = f"Analysis timeout: {str(e)}"
+                log_task.cancel()
                 return
             except Exception as kill_e:
                 logger.error(f"Failed to kill container: {kill_e}")
         
-        # Get container logs for debugging
+        # Cancel log monitoring
+        log_task.cancel()
+        
+        # Get final container logs for debugging
         logs = container.logs().decode('utf-8')
         jobs[job_id]["container_logs"] = logs[-2000:]  # Keep last 2000 chars
         
-        if result["StatusCode"] == 0:
+        # Check container status
+        container.reload()
+        exit_code = container.attrs['State']['ExitCode']
+        
+        if exit_code == 0:
             jobs[job_id]["status"] = "completed"
             jobs[job_id]["progress"] = "Analysis completed successfully"
             jobs[job_id]["completed_at"] = datetime.now().isoformat()
             logger.info(f"✅ Analysis job {job_id} completed successfully")
         else:
             jobs[job_id]["status"] = "failed"
-            jobs[job_id]["error"] = f"Container exited with code {result['StatusCode']}"
-            logger.error(f"❌ Analysis job {job_id} failed with exit code {result['StatusCode']}")
+            jobs[job_id]["error"] = f"Container exited with code {exit_code}"
+            # Check for specific error patterns in logs
+            if "No filtered articles found" in logs:
+                jobs[job_id]["error"] = "No articles found for screening - pipeline completed with warnings"
+                jobs[job_id]["status"] = "completed_with_warnings"
+            logger.error(f"❌ Analysis job {job_id} failed with exit code {exit_code}")
             logger.error(f"Container logs: {logs[-500:]}")  # Log last 500 chars
             
         # Clean up container
@@ -356,23 +421,44 @@ async def get_job_logs(job_id: str):
 
 @app.get("/jobs/{job_id}/logs/stream")
 async def get_job_logs_stream(job_id: str):
-    """Stream job logs in real-time"""
+    """Stream job logs in real-time using Server-Sent Events"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     
     async def log_generator():
-        # This would stream logs from the container or log files
-        # For now, return job progress updates
-        job = jobs[job_id]
-        yield f"data: {json.dumps({'message': job.get('progress', 'No progress info')})}\n\n"
+        last_log_count = 0
         
-        if job['status'] == 'failed' and 'error' in job:
-            yield f"data: {json.dumps({'error': job['error']})}\n\n"
+        while True:
+            if job_id not in jobs:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Job not found'})}\n\n"
+                break
+                
+            job = jobs[job_id]
             
-        if 'container_logs' in job:
-            yield f"data: {json.dumps({'container_logs': job['container_logs']})}\n\n"
+            # Send status update
+            yield f"data: {json.dumps({'type': 'status', 'status': job.get('status'), 'progress': job.get('progress')})}\n\n"
+            
+            # Send new logs if available
+            recent_logs = job.get('recent_logs', [])
+            if len(recent_logs) > last_log_count:
+                new_logs = recent_logs[last_log_count:]
+                for log_line in new_logs:
+                    yield f"data: {json.dumps({'type': 'log', 'message': log_line})}\n\n"
+                last_log_count = len(recent_logs)
+            
+            # Send latest activity
+            if 'latest_log' in job:
+                yield f"data: {json.dumps({'type': 'latest', 'message': job['latest_log'], 'timestamp': job.get('last_activity')})}\n\n"
+            
+            # If job is completed or failed, send final update and break
+            if job.get('status') in ['completed', 'failed', 'completed_with_warnings']:
+                yield f"data: {json.dumps({'type': 'final', 'status': job['status'], 'message': job.get('error', 'Job completed')})}\n\n"
+                break
+                
+            # Wait before next update
+            await asyncio.sleep(2)
     
-    return StreamingResponse(log_generator(), media_type="text/plain")
+    return StreamingResponse(log_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
 @app.get("/jobs/{job_id}/files/{filename}")
@@ -382,12 +468,68 @@ async def download_file(job_id: str, filename: str):
         raise HTTPException(status_code=404, detail="Job not found")
     
     job = jobs[job_id]
-    if job['status'] != 'completed':
-        raise HTTPException(status_code=400, detail="Job not completed")
+    ticker = job.get('ticker', '').upper()
     
-    # This would need to be implemented based on how files are stored
-    # in the Docker volume. For now, return a placeholder.
-    raise HTTPException(status_code=501, detail="File download not yet implemented")
+    # For info.log, we can read it directly from the Docker volume
+    if filename == "info.log" and docker_client:
+        try:
+            # Create a temporary container to access the volume
+            temp_container = docker_client.containers.run(
+                "alpine:latest",
+                command=f"cat /data/{ticker}/info.log",
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                remove=True,
+                detach=False
+            )
+            
+            log_content = temp_container.decode('utf-8')
+            
+            # Return as plain text
+            from fastapi.responses import PlainTextResponse
+            return PlainTextResponse(log_content, media_type="text/plain")
+            
+        except Exception as e:
+            logger.error(f"Error reading {filename} for job {job_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"Could not read {filename}: {str(e)}")
+    
+    # For other files, return placeholder for now
+    raise HTTPException(status_code=501, detail="File download not yet implemented for this file type")
+
+
+@app.get("/jobs/{job_id}/info-log")
+async def get_info_log(job_id: str):
+    """Get the info.log file content for a job"""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    ticker = job.get('ticker', '').upper()
+    
+    if not docker_client:
+        raise HTTPException(status_code=503, detail="Docker not available")
+    
+    try:
+        # Read info.log from the volume
+        temp_container = docker_client.containers.run(
+            "alpine:latest",
+            command=f"cat /data/{ticker}/info.log",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            remove=True,
+            detach=False
+        )
+        
+        log_content = temp_container.decode('utf-8')
+        
+        return {
+            "job_id": job_id,
+            "ticker": ticker,
+            "log_content": log_content,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error reading info.log for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read info.log: {str(e)}")
 
 
 if __name__ == "__main__":
