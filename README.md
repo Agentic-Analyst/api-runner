@@ -51,7 +51,7 @@ cp .env.example .env
 
 # Then build and run
 docker ps -a | grep api-runner
-docker rm api-runner
+docker stop api-runner && docker rm api-runner
 docker build -t stock-analyst-runner . && echo "Build completed successfully"
 docker run -d -p 8080:8080 -v /var/run/docker.sock:/var/run/docker.sock --env-file .env --name api-runner stock-analyst-runner
 ```
