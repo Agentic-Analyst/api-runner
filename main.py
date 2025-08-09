@@ -21,11 +21,13 @@ from pathlib import Path
 import tempfile
 import zipfile
 import shutil
+from io import BytesIO
+import shlex
 
 import docker
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, PlainTextResponse
 from pydantic import BaseModel
 import aiofiles
 import uvicorn
@@ -74,6 +76,10 @@ class JobRequest(BaseModel):
     company: Optional[str] = None
     query: Optional[str] = None
     pipeline: Optional[str] = "full"
+    max_articles: Optional[int] = None
+    min_score: Optional[float] = None
+    max_filtered: Optional[int] = None
+    min_confidence: Optional[float] = None
 
 class JobResponse(BaseModel):
     job_id: str
@@ -97,17 +103,13 @@ class JobStatus(BaseModel):
 def init_docker_client():
     """Initialize Docker client with proper error handling"""
     global docker_client
-    
+
     try:
-        # Try different connection methods
         logger.info("Initializing Docker client...")
-        
-        # Method 1: Default connection
         docker_client = docker.from_env()
         docker_client.ping()
         logger.info("✅ Docker client connected successfully")
         return True
-        
     except Exception as e:
         logger.error(f"❌ Failed to connect to Docker: {e}")
         docker_client = None
@@ -118,7 +120,7 @@ def ensure_volume_exists():
     """Ensure the data volume exists"""
     if not docker_client:
         return False
-        
+
     try:
         docker_client.volumes.get(DATA_VOLUME)
         logger.info(f"✅ Volume '{DATA_VOLUME}' exists")
@@ -144,18 +146,18 @@ async def monitor_info_log(job_id: str, container):
                 ticker = jobs[job_id].get('ticker', '').upper()
                 last_info_log_size = 0
                 container_running = True
-                
+
                 while container_running:
                     if job_id not in jobs:
                         break
-                    
+
                     # Check if container is still running
                     try:
                         container.reload()
                         container_running = container.status == 'running'
                     except:
                         container_running = False
-                    
+
                     try:
                         # Monitor info.log for real-time updates - Get file size
                         temp_container = docker_client.containers.run(
@@ -166,7 +168,7 @@ async def monitor_info_log(job_id: str, container):
                             detach=False
                         )
                         current_size = int(temp_container.decode('utf-8').strip())
-                        
+
                         if current_size > last_info_log_size:
                             # Get new content from info.log
                             temp_container2 = docker_client.containers.run(
@@ -177,7 +179,7 @@ async def monitor_info_log(job_id: str, container):
                                 detach=False
                             )
                             new_content = temp_container2.decode('utf-8').strip()
-                            
+
                             if new_content:
                                 # Process each new line from info.log
                                 for line in new_content.split('\n'):
@@ -185,14 +187,14 @@ async def monitor_info_log(job_id: str, container):
                                         # Store latest log line
                                         jobs[job_id]["latest_log"] = line.strip()
                                         jobs[job_id]["last_activity"] = datetime.now().isoformat()
-                                        
+
                                         # Store recent logs from info.log
                                         if "recent_logs" not in jobs[job_id]:
                                             jobs[job_id]["recent_logs"] = []
                                         jobs[job_id]["recent_logs"].append(line.strip())
                                         if len(jobs[job_id]["recent_logs"]) > 100:
                                             jobs[job_id]["recent_logs"].pop(0)
-                                        
+
                                         # Parse specific logging patterns for progress updates
                                         if "PIPELINE SESSION COMPLETED" in line:
                                             jobs[job_id]["progress"] = "Analysis completed successfully"
@@ -208,19 +210,27 @@ async def monitor_info_log(job_id: str, container):
                                         elif "ERROR" in line:
                                             error_msg = line.split("|")[-1].strip() if "|" in line else line
                                             jobs[job_id]["error"] = error_msg
-                                            jobs[job_id]["status"] = "failed"
-                            
+                                            
+                                            # Distinguish between LLM timeout and other failures
+                                            if any(timeout_keyword in error_msg.lower() for timeout_keyword in 
+                                                  ["timeout", "timed out", "connection timeout", "read timeout", 
+                                                   "llm", "openai timeout", "api timeout"]):
+                                                jobs[job_id]["status"] = "llm_timeout"
+                                                jobs[job_id]["progress"] = "LLM analysis timed out - retrying may help"
+                                            else:
+                                                jobs[job_id]["status"] = "failed"
+
                             last_info_log_size = current_size
-                    
+
                     except Exception as info_log_error:
                         # Info.log might not exist yet, that's OK
                         pass
-                    
+
                     # If container stopped, do one final read
                     if not container_running:
                         try:
                             final_temp = docker_client.containers.run(
-                                "alpine:latest", 
+                                "alpine:latest",
                                 command=f"sh -c 'if [ -f /data/{ticker}/info.log ]; then tail -c +{last_info_log_size + 1} /data/{ticker}/info.log; fi'",
                                 volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
                                 remove=True,
@@ -237,47 +247,50 @@ async def monitor_info_log(job_id: str, container):
                         except:
                             pass
                         break
-                    
+
                     # Wait before next check
                     time.sleep(2)
-                    
+
             except Exception as e:
                 logger.error(f"Error in log monitoring for job {job_id}: {e}")
-        
+
         # Run log monitoring in thread pool
         loop = asyncio.get_event_loop()
         with concurrent.futures.ThreadPoolExecutor() as executor:
             await loop.run_in_executor(executor, monitor_logs)
-                    
+
     except Exception as e:
         logger.error(f"Error monitoring logs for job {job_id}: {e}")
 
 
-async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = None, query: Optional[str] = None, pipeline: str = "full"):
+async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = None, query: Optional[str] = None, 
+                         pipeline: str = "full", max_articles: Optional[int] = None, min_score: Optional[float] = None, 
+                         max_filtered: Optional[int] = None, min_confidence: Optional[float] = None):
     """Run stock analysis job in Docker container with real-time monitoring"""
     if not docker_client:
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = "Docker client not available"
         return
-    
+
     try:
         jobs[job_id]["status"] = "running"
         jobs[job_id]["progress"] = "Starting analysis container..."
         jobs[job_id]["recent_logs"] = []
-        
+
         # Prepare environment variables
         env_vars = {
             "SERPAPI_API_KEY": SERPAPI_API_KEY,
             "OPENAI_API_KEY": OPENAI_API_KEY,
+            "DATA_PATH": "/data",  # Tell backend to use /data path
         }
-        
+
         # Prepare command - backend requires both ticker and company
         if not company:
             # Try to infer company name from common tickers
             company_map = {
                 "AAPL": "Apple Inc",
                 "GOOGL": "Alphabet Inc",
-                "MSFT": "Microsoft Corporation", 
+                "MSFT": "Microsoft Corporation",
                 "AMZN": "Amazon.com Inc",
                 "TSLA": "Tesla Inc",
                 "NVDA": "NVIDIA Corporation",
@@ -285,14 +298,22 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = No
                 "NFLX": "Netflix Inc"
             }
             company = company_map.get(ticker.upper(), f"{ticker.upper()} Corporation")
-        
+
         cmd = ["--ticker", ticker, "--company", company, "--pipeline", pipeline]
         if query:
             cmd.extend(["--search-query", query])
-        
+        if max_articles is not None:
+            cmd.extend(["--max-articles", str(max_articles)])
+        if min_score is not None:
+            cmd.extend(["--min-score", str(min_score)])
+        if max_filtered is not None:
+            cmd.extend(["--max-filtered", str(max_filtered)])
+        if min_confidence is not None:
+            cmd.extend(["--min-confidence", str(min_confidence)])
+
         logger.info(f"🚀 Starting analysis for {ticker} ({company}) with command: {cmd}")
         jobs[job_id]["progress"] = f"Running {pipeline} analysis for {ticker} ({company})..."
-        
+
         # Run container
         container = docker_client.containers.run(
             BACKEND_IMAGE,
@@ -303,43 +324,50 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = No
             remove=False,  # Don't auto-remove so we can get logs
             name=f"analysis-{job_id}"
         )
-        
+
         jobs[job_id]["container_id"] = container.id
         jobs[job_id]["progress"] = "Analysis running..."
-        
+
         # Start log monitoring in background
         loop = asyncio.get_event_loop()
-        
+
         # Monitor logs in a separate task
         log_task = asyncio.create_task(monitor_info_log(job_id, container))
-        
+
         # Wait for container to complete with timeout
         try:
             def wait_for_container():
                 return container.wait(timeout=1800)  # 30 minute timeout
-            
+
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                result = await loop.run_in_executor(executor, wait_for_container)
-                
+                _ = await loop.run_in_executor(executor, wait_for_container)
+
         except Exception as e:
             logger.error(f"Container wait timeout or error: {e}")
             # Kill the container if it's taking too long
             try:
                 container.kill()
-                jobs[job_id]["status"] = "failed"
-                jobs[job_id]["error"] = f"Analysis timeout: {str(e)}"
+                # Check if we were in LLM analysis phase when timeout occurred
+                current_progress = jobs[job_id].get("progress", "").lower()
+                if "llm analysis" in current_progress or "running llm" in current_progress:
+                    jobs[job_id]["status"] = "llm_timeout"
+                    jobs[job_id]["error"] = f"LLM analysis timeout after 30 minutes: {str(e)}"
+                    jobs[job_id]["progress"] = "LLM analysis timed out - retrying may help"
+                else:
+                    jobs[job_id]["status"] = "failed"
+                    jobs[job_id]["error"] = f"Analysis timeout: {str(e)}"
                 log_task.cancel()
                 return
             except Exception as kill_e:
                 logger.error(f"Failed to kill container: {kill_e}")
-        
+
         # Cancel log monitoring
         log_task.cancel()
-        
+
         # Check container status
         container.reload()
         exit_code = container.attrs['State']['ExitCode']
-        
+
         if exit_code == 0:
             # Status will be set by log monitoring when it sees completion
             if jobs[job_id]["status"] != "completed":
@@ -348,27 +376,43 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = No
             jobs[job_id]["completed_at"] = datetime.now().isoformat()
             logger.info(f"✅ Analysis job {job_id} completed successfully")
         else:
-            jobs[job_id]["status"] = "failed"
-            jobs[job_id]["error"] = f"Container exited with code {exit_code}"
-            logger.error(f"❌ Analysis job {job_id} failed with exit code {exit_code}")
-            
-        # Clean up container
+            # Check if this was an LLM timeout scenario before marking as failed
+            current_status = jobs[job_id].get("status")
+            if current_status == "llm_timeout":
+                # Keep the LLM timeout status, don't override to failed
+                logger.warning(f"⚠️ Analysis job {job_id} timed out during LLM analysis")
+            else:
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["error"] = f"Container exited with code {exit_code}"
+                logger.error(f"❌ Analysis job {job_id} failed with exit code {exit_code}")
+
+        # Clean up container (OK since we read via named volume)
         try:
             container.remove()
         except Exception as e:
             logger.warning(f"Failed to remove container: {e}")
-            
+
     except Exception as e:
         logger.error(f"❌ Error in analysis job {job_id}: {e}")
-        jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = str(e)
+        # Check if this might be an LLM-related timeout
+        error_str = str(e).lower()
+        current_progress = jobs[job_id].get("progress", "").lower()
+        
+        if (("timeout" in error_str or "timed out" in error_str or "llm" in error_str) and 
+            ("llm analysis" in current_progress or "running llm" in current_progress)):
+            jobs[job_id]["status"] = "llm_timeout"
+            jobs[job_id]["error"] = f"LLM analysis timeout: {str(e)}"
+            jobs[job_id]["progress"] = "LLM analysis timed out - retrying may help"
+        else:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = str(e)
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
     logger.info("🚀 Starting Stock Analyst API Runner...")
-    
+
     # Initialize Docker
     docker_ready = init_docker_client()
     if not docker_ready:
@@ -376,17 +420,17 @@ async def startup_event():
     else:
         # Ensure volume exists
         ensure_volume_exists()
-    
+
     # Check API keys
     if not SERPAPI_API_KEY:
         logger.warning("⚠️ SERPAPI_API_KEY not set")
     else:
         logger.info("✅ SERPAPI_API_KEY configured")
     if not OPENAI_API_KEY:
-        logger.warning("⚠️ OPENAI_API_KEY not set")  
+        logger.warning("⚠️ OPENAI_API_KEY not set")
     else:
         logger.info("✅ OPENAI_API_KEY configured")
-    
+
     logger.info("✅ API Runner started successfully")
 
 
@@ -405,7 +449,7 @@ async def root():
 async def health_check():
     """Detailed health check"""
     docker_status = "connected" if docker_client else "disconnected"
-    
+
     return {
         "status": "healthy",
         "docker": docker_status,
@@ -420,16 +464,28 @@ async def health_check():
 
 @app.post("/run", response_model=JobResponse)
 async def start_analysis(request: JobRequest, background_tasks: BackgroundTasks):
-    """Start a new stock analysis job"""
+    """
+    Start a new stock analysis job
+    
+    Parameters:
+    - ticker: Stock ticker symbol (e.g., "NVDA")
+    - company: Company name (optional, will be inferred if not provided)
+    - query: Custom search query (optional)
+    - pipeline: Analysis pipeline ("full", "scrape-only", "filter-only", "screen-only", "filter-screen")
+    - max_articles: Maximum articles to scrape (optional, default: 20)
+    - min_score: Minimum relevance score for filtering (optional, default: 3.0)
+    - max_filtered: Maximum filtered articles to keep (optional, default: 10)
+    - min_confidence: Minimum confidence for LLM insights (optional, default: 0.5)
+    """
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker service not available")
-    
+
     if not SERPAPI_API_KEY or not OPENAI_API_KEY:
         raise HTTPException(status_code=400, detail="API keys not configured")
-    
+
     # Generate job ID
     job_id = f"{request.ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
+
     # Create job record
     jobs[job_id] = {
         "job_id": job_id,
@@ -439,10 +495,11 @@ async def start_analysis(request: JobRequest, background_tasks: BackgroundTasks)
         "created_at": datetime.now().isoformat(),
         "progress": "Job queued"
     }
-    
+
     # Start background task
-    background_tasks.add_task(run_analysis_job, job_id, request.ticker, request.company, request.query, request.pipeline)
-    
+    background_tasks.add_task(run_analysis_job, job_id, request.ticker, request.company, request.query, request.pipeline,
+                             request.max_articles, request.min_score, request.max_filtered, request.min_confidence)
+
     return JobResponse(
         job_id=job_id,
         status="pending",
@@ -455,7 +512,7 @@ async def get_job_status(job_id: str):
     """Get status of a specific job"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
     return JobStatus(**job)
 
@@ -471,9 +528,9 @@ async def get_job_logs(job_id: str):
     """Get detailed job logs from info.log file"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
-    
+
     return {
         "job_id": job_id,
         "status": job.get("status"),
@@ -490,21 +547,21 @@ async def get_job_logs_stream(job_id: str):
     """Stream info.log file content directly in real-time using Server-Sent Events"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
     ticker = job.get('ticker', '').upper()
     container_id = job.get('container_id')
-    
+
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker not available")
-    
+
     async def log_generator():
         last_size = 0
         container = None
-        
+
         # Send initial connection confirmation
         yield f"data: {json.dumps({'message': f'Connected to log stream for {ticker}', 'timestamp': datetime.now().isoformat(), 'type': 'connection'})}\n\n"
-        
+
         # Try to get the analysis container
         if container_id:
             try:
@@ -512,31 +569,36 @@ async def get_job_logs_stream(job_id: str):
                 logger.info(f"Found analysis container for {ticker}: {container_id}")
             except docker.errors.NotFound:
                 logger.info(f"Analysis container not found for {ticker}, will check volume")
-        
+
         while True:
             try:
                 current_size = 0
                 new_content = ""
-                
+
                 # First, try to read from the running analysis container
                 if container:
                     try:
                         container.reload()
                         if container.status == 'running':
-                            # Read directly from the analysis container's working directory
-                            size_result = container.exec_run(f"sh -c 'if [ -f data/{ticker}/info.log ]; then wc -c data/{ticker}/info.log | cut -d\" \" -f1; else echo 0; fi'")
+                            # NOTE: inside the analysis container the volume is at /data
+                            size_result = container.exec_run(
+                                f"sh -c 'if [ -f /data/{ticker}/info.log ]; then wc -c /data/{ticker}/info.log | cut -d\" \" -f1; else echo 0; fi'"
+                            )
                             if size_result.exit_code == 0:
-                                current_size = int(size_result.output.decode('utf-8').strip())
-                                
+                                current_size = int(size_result.output.decode('utf-8').strip() or "0")
+
                                 if current_size > last_size:
-                                    # Get new content from the container
-                                    content_result = container.exec_run(f"sh -c 'if [ -f data/{ticker}/info.log ]; then tail -c +{last_size + 1} data/{ticker}/info.log; fi'")
+                                    content_result = container.exec_run(
+                                        f"sh -c 'if [ -f /data/{ticker}/info.log ]; then tail -c +{last_size + 1} /data/{ticker}/info.log; fi'"
+                                    )
                                     if content_result.exit_code == 0:
                                         new_content = content_result.output.decode('utf-8').strip()
                         else:
                             # Container finished, try one final read then switch to volume
                             try:
-                                content_result = container.exec_run(f"sh -c 'if [ -f data/{ticker}/info.log ]; then tail -c +{last_size + 1} data/{ticker}/info.log; fi'")
+                                content_result = container.exec_run(
+                                    f"sh -c 'if [ -f /data/{ticker}/info.log ]; then tail -c +{last_size + 1} /data/{ticker}/info.log; fi'"
+                                )
                                 if content_result.exit_code == 0:
                                     new_content = content_result.output.decode('utf-8').strip()
                                     if new_content:
@@ -547,7 +609,7 @@ async def get_job_logs_stream(job_id: str):
                     except Exception as container_error:
                         logger.warning(f"Error reading from container {container_id}: {container_error}")
                         container = None
-                
+
                 # If no container or container method failed, try volume (fallback)
                 if current_size == 0 and last_size == 0:
                     try:
@@ -558,8 +620,8 @@ async def get_job_logs_stream(job_id: str):
                             remove=True,
                             detach=False
                         )
-                        volume_size = int(size_container.decode('utf-8').strip())
-                        
+                        volume_size = int(size_container.decode('utf-8').strip() or "0")
+
                         if volume_size > last_size:
                             content_container = docker_client.containers.run(
                                 "alpine:latest",
@@ -572,7 +634,7 @@ async def get_job_logs_stream(job_id: str):
                             current_size = volume_size
                     except Exception as volume_error:
                         logger.debug(f"Volume read failed (expected if file doesn't exist yet): {volume_error}")
-                
+
                 # Process new content if any
                 if new_content:
                     logger.info(f"New content found for {ticker}: {len(new_content)} characters")
@@ -593,17 +655,17 @@ async def get_job_logs_stream(job_id: str):
                                 break
                             else:
                                 yield f"data: {json.dumps({'message': 'Waiting for analysis to start...', 'timestamp': datetime.now().isoformat(), 'type': 'status'})}\n\n"
-                
+
             except Exception as e:
                 logger.error(f"Error streaming info.log for job {job_id}: {e}")
                 yield f"data: {json.dumps({'error': f'Stream error: {str(e)}', 'timestamp': datetime.now().isoformat(), 'type': 'error'})}\n\n"
                 break
-            
+
             # Wait before next check
             await asyncio.sleep(1)
-    
+
     return StreamingResponse(log_generator(), media_type="text/event-stream", headers={
-        "Cache-Control": "no-cache", 
+        "Cache-Control": "no-cache",
         "Connection": "keep-alive",
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET",
@@ -613,53 +675,55 @@ async def get_job_logs_stream(job_id: str):
 
 @app.get("/jobs/{job_id}/files/{filename}")
 async def download_file(job_id: str, filename: str):
-    """Download a specific file from job results"""
+    """
+    Download a specific top-level file from job results.
+    Supported: info.log, screening_report.md, screening_data.json
+    """
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
     ticker = job.get('ticker', '').upper()
-    
-    # For info.log, we can read it directly from the Docker volume
-    if filename == "info.log" and docker_client:
-        try:
-            # Create a temporary container to access the volume
-            temp_container = docker_client.containers.run(
-                "alpine:latest",
-                command=f"cat /data/{ticker}/info.log",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                remove=True,
-                detach=False
-            )
-            
-            log_content = temp_container.decode('utf-8')
-            
-            # Return as plain text
-            from fastapi.responses import PlainTextResponse
-            return PlainTextResponse(log_content, media_type="text/plain")
-            
-        except Exception as e:
-            logger.error(f"Error reading {filename} for job {job_id}: {e}")
-            raise HTTPException(status_code=500, detail=f"Could not read {filename}: {str(e)}")
-    
-    # For other files, return placeholder for now
-    raise HTTPException(status_code=501, detail="File download not yet implemented for this file type")
+
+    if not docker_client:
+        raise HTTPException(status_code=503, detail="Docker not available")
+
+    supported = {"info.log": "text/plain",
+                 "screening_report.md": "text/markdown",
+                 "screening_data.json": "application/json"}
+    if filename not in supported:
+        raise HTTPException(status_code=400, detail=f"Unsupported filename '{filename}'")
+
+    try:
+        path = f"/data/{ticker}/{filename}"
+        result = docker_client.containers.run(
+            "alpine:latest",
+            command=f"sh -c 'cat {shlex.quote(path)}'",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            remove=True,
+            detach=False
+        )
+        media_type = supported[filename]
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return StreamingResponse(BytesIO(result), media_type=media_type, headers=headers)
+    except Exception as e:
+        logger.error(f"Error reading {filename} for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read {filename}: {str(e)}")
 
 
 @app.get("/jobs/{job_id}/info-log")
 async def get_info_log(job_id: str):
-    """Get the info.log file content for a job"""
+    """Get the info.log file content for a job as JSON payload"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
     ticker = job.get('ticker', '').upper()
-    
+
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker not available")
-    
+
     try:
-        # Read info.log from the volume
         temp_container = docker_client.containers.run(
             "alpine:latest",
             command=f"cat /data/{ticker}/info.log",
@@ -667,16 +731,16 @@ async def get_info_log(job_id: str):
             remove=True,
             detach=False
         )
-        
+
         log_content = temp_container.decode('utf-8')
-        
+
         return {
             "job_id": job_id,
             "ticker": ticker,
             "log_content": log_content,
             "timestamp": datetime.now().isoformat()
         }
-        
+
     except Exception as e:
         logger.error(f"Error reading info.log for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not read info.log: {str(e)}")
@@ -684,77 +748,51 @@ async def get_info_log(job_id: str):
 
 @app.get("/jobs/{job_id}/download/searched-articles")
 async def download_searched_articles(job_id: str):
-    """Download all searched articles as a zip file"""
+    """Download all searched articles as a zip file (in-memory)"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
     ticker = job.get('ticker', '').upper()
-    
+
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker not available")
-    
+
     try:
-        # Create a temporary directory to extract files
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Copy searched articles from Docker volume to temp directory
-            temp_container = docker_client.containers.run(
-                "alpine:latest",
-                command=f"sh -c 'if [ -d /data/{ticker}/searched ]; then tar -czf /tmp/searched.tar.gz -C /data/{ticker}/searched .; else echo \"No searched articles\"; fi'",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                remove=True,
-                detach=False
-            )
-            
-            # Extract the tar.gz to temp directory
-            extract_container = docker_client.containers.run(
-                "alpine:latest",
-                command=f"sh -c 'if [ -f /data/{ticker}/searched.tar.gz ]; then cp /data/{ticker}/searched.tar.gz /tmp/; fi'",
-                volumes={
-                    DATA_VOLUME: {'bind': '/data', 'mode': 'ro'},
-                    temp_dir: {'bind': '/tmp', 'mode': 'rw'}
-                },
-                remove=True,
-                detach=False
-            )
-            
-            zip_path = os.path.join(temp_dir, f"{ticker}_searched_articles.zip")
-            
-            # Create zip file with all searched articles
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                # Get list of files from Docker volume
-                list_container = docker_client.containers.run(
-                    "alpine:latest",
-                    command=f"sh -c 'if [ -d /data/{ticker}/searched ]; then find /data/{ticker}/searched -name \"*.md\" -type f; fi'",
-                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                    remove=True,
-                    detach=False
-                )
-                
-                file_list = list_container.decode('utf-8').strip().split('\n')
-                
-                for file_path in file_list:
-                    if file_path.strip() and file_path.endswith('.md'):
-                        # Read each file content
-                        file_container = docker_client.containers.run(
-                            "alpine:latest",
-                            command=f"cat {file_path}",
-                            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                            remove=True,
-                            detach=False
-                        )
-                        
-                        content = file_container.decode('utf-8')
-                        filename = os.path.basename(file_path)
-                        zipf.writestr(filename, content)
-            
-            # Return the zip file
-            return FileResponse(
-                zip_path,
-                media_type='application/zip',
-                filename=f"{ticker}_searched_articles.zip"
-            )
-    
+        list_result = docker_client.containers.run(
+            "alpine:latest",
+            command=f"sh -c 'if [ -d /data/{ticker}/searched ]; then find /data/{ticker}/searched -name \"*.md\" -type f; fi'",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            remove=True,
+            detach=False
+        )
+        file_list = [p.strip() for p in list_result.decode('utf-8').splitlines() if p.strip().endswith(".md")]
+
+        if not file_list:
+            raise HTTPException(status_code=404, detail="No searched articles found")
+
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for path in file_list:
+                try:
+                    content = docker_client.containers.run(
+                        "alpine:latest",
+                        command=f"sh -c 'cat {shlex.quote(path)}'",
+                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                        remove=True,
+                        detach=False
+                    )
+                    zipf.writestr(os.path.basename(path), content)
+                except Exception as e:
+                    logger.warning(f"Could not read file {path}: {e}")
+                    continue
+
+        buf.seek(0)
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_searched_articles.zip"'}
+        return StreamingResponse(buf, media_type="application/zip", headers=headers)
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating searched articles zip for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not create zip file: {str(e)}")
@@ -762,70 +800,68 @@ async def download_searched_articles(job_id: str):
 
 @app.get("/jobs/{job_id}/download/filtered-articles")
 async def download_filtered_articles(job_id: str):
-    """Download all filtered articles as a zip file"""
+    """Download all filtered articles as a zip file (in-memory)"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
     ticker = job.get('ticker', '').upper()
-    
+
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker not available")
-    
+
     try:
-        # Create a temporary directory for the zip file
-        with tempfile.TemporaryDirectory() as temp_dir:
-            zip_path = os.path.join(temp_dir, f"{ticker}_filtered_articles.zip")
-            
-            # Create zip file with all filtered articles
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                # Get list of filtered files from Docker volume
-                list_container = docker_client.containers.run(
-                    "alpine:latest",
-                    command=f"sh -c 'if [ -d /data/{ticker}/filtered ]; then find /data/{ticker}/filtered -name \"filtered_*.md\" -type f; fi'",
-                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                    remove=True,
-                    detach=False
-                )
-                
-                file_list = list_container.decode('utf-8').strip().split('\n')
-                
-                for file_path in file_list:
-                    if file_path.strip() and file_path.endswith('.md'):
-                        # Read each file content
-                        file_container = docker_client.containers.run(
-                            "alpine:latest",
-                            command=f"cat {file_path}",
-                            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                            remove=True,
-                            detach=False
-                        )
-                        
-                        content = file_container.decode('utf-8')
-                        filename = os.path.basename(file_path)
-                        zipf.writestr(filename, content)
-                
-                # Also include the filtered articles index if it exists
+        list_result = docker_client.containers.run(
+            "alpine:latest",
+            command=f"sh -c 'if [ -d /data/{ticker}/filtered ]; then find /data/{ticker}/filtered -name \"filtered_*.md\" -type f; fi'",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            remove=True,
+            detach=False
+        )
+        file_list = [p.strip() for p in list_result.decode('utf-8').splitlines() if p.strip().endswith(".md")]
+
+        if not file_list:
+            raise HTTPException(status_code=404, detail="No filtered articles found")
+
+        # Try to include index CSV if present
+        index_content: Optional[bytes] = None
+        try:
+            idx = docker_client.containers.run(
+                "alpine:latest",
+                command=f"sh -c 'cat /data/{ticker}/filtered/filtered_articles_index.csv'",
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                remove=True,
+                detach=False
+            )
+            index_content = idx if idx else None
+        except Exception:
+            index_content = None
+
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for path in file_list:
                 try:
-                    index_container = docker_client.containers.run(
+                    content = docker_client.containers.run(
                         "alpine:latest",
-                        command=f"cat /data/{ticker}/filtered/filtered_articles_index.csv",
+                        command=f"sh -c 'cat {shlex.quote(path)}'",
                         volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
                         remove=True,
                         detach=False
                     )
-                    index_content = index_container.decode('utf-8')
-                    zipf.writestr("filtered_articles_index.csv", index_content)
-                except:
-                    pass  # Index file might not exist
-            
-            # Return the zip file
-            return FileResponse(
-                zip_path,
-                media_type='application/zip',
-                filename=f"{ticker}_filtered_articles.zip"
-            )
-    
+                    zipf.writestr(os.path.basename(path), content)
+                except Exception as e:
+                    logger.warning(f"Could not read file {path}: {e}")
+                    continue
+
+            if index_content:
+                zipf.writestr("filtered_articles_index.csv", index_content)
+
+        buf.seek(0)
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_filtered_articles.zip"'}
+        return StreamingResponse(buf, media_type="application/zip", headers=headers)
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating filtered articles zip for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not create zip file: {str(e)}")
@@ -833,162 +869,149 @@ async def download_filtered_articles(job_id: str):
 
 @app.get("/jobs/{job_id}/download/screening-report")
 async def download_screening_report(job_id: str):
-    """Download the screening report markdown file"""
+    """Download the screening_report.md file (in-memory)"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
     ticker = job.get('ticker', '').upper()
-    
+
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker not available")
-    
+
     try:
-        # Read screening_report.md from the volume
-        temp_container = docker_client.containers.run(
+        result = docker_client.containers.run(
             "alpine:latest",
-            command=f"cat /data/{ticker}/screening_report.md",
+            command=f"sh -c 'cat /data/{ticker}/screening_report.md'",
             volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
             remove=True,
             detach=False
         )
-        
-        report_content = temp_container.decode('utf-8')
-        
-        # Create a temporary file to serve
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as temp_file:
-            temp_file.write(report_content)
-            temp_path = temp_file.name
-        
-        # Return the markdown file
-        return FileResponse(
-            temp_path,
-            media_type='text/markdown',
-            filename=f"{ticker}_screening_report.md"
-        )
-        
+        if not result:
+            raise HTTPException(status_code=404, detail="Screening report not found")
+
+        headers = {"Content-Disposition": f'attachment; filename=\"{ticker}_screening_report.md\"'}
+        return StreamingResponse(BytesIO(result), media_type='text/markdown', headers=headers)
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error reading screening report for job {job_id}: {e}")
+        logger.error(f"Error downloading screening report for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not read screening report: {str(e)}")
 
 
 @app.get("/jobs/{job_id}/download/all-results")
 async def download_all_results(job_id: str):
-    """Download all analysis results as a comprehensive zip file"""
+    """Download all analysis results as a comprehensive zip file (in-memory)"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
     ticker = job.get('ticker', '').upper()
-    
+
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker not available")
-    
+
     try:
-        # Create a temporary directory for the comprehensive zip file
-        with tempfile.TemporaryDirectory() as temp_dir:
-            zip_path = os.path.join(temp_dir, f"{ticker}_complete_analysis.zip")
-            
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                # Add info.log
-                try:
-                    log_container = docker_client.containers.run(
-                        "alpine:latest",
-                        command=f"cat /data/{ticker}/info.log",
-                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                        remove=True,
-                        detach=False
-                    )
-                    log_content = log_container.decode('utf-8')
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Add info.log
+            try:
+                log_content = docker_client.containers.run(
+                    "alpine:latest",
+                    command=f"sh -c 'cat /data/{ticker}/info.log'",
+                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                    remove=True,
+                    detach=False
+                )
+                if log_content:
                     zipf.writestr("info.log", log_content)
-                except:
-                    pass
-                
-                # Add screening report
-                try:
-                    report_container = docker_client.containers.run(
-                        "alpine:latest",
-                        command=f"cat /data/{ticker}/screening_report.md",
-                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                        remove=True,
-                        detach=False
-                    )
-                    report_content = report_container.decode('utf-8')
+            except Exception:
+                pass
+
+            # Add screening report
+            try:
+                report_content = docker_client.containers.run(
+                    "alpine:latest",
+                    command=f"sh -c 'cat /data/{ticker}/screening_report.md'",
+                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                    remove=True,
+                    detach=False
+                )
+                if report_content:
                     zipf.writestr("screening_report.md", report_content)
-                except:
-                    pass
-                
-                # Add structured data JSON
-                try:
-                    json_container = docker_client.containers.run(
-                        "alpine:latest",
-                        command=f"cat /data/{ticker}/screening_data.json",
-                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                        remove=True,
-                        detach=False
-                    )
-                    json_content = json_container.decode('utf-8')
+            except Exception:
+                pass
+
+            # Add structured data JSON
+            try:
+                json_content = docker_client.containers.run(
+                    "alpine:latest",
+                    command=f"sh -c 'cat /data/{ticker}/screening_data.json'",
+                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                    remove=True,
+                    detach=False
+                )
+                if json_content:
                     zipf.writestr("screening_data.json", json_content)
-                except:
-                    pass
-                
-                # Add searched articles
-                try:
-                    searched_list = docker_client.containers.run(
-                        "alpine:latest",
-                        command=f"sh -c 'if [ -d /data/{ticker}/searched ]; then find /data/{ticker}/searched -name \"*.md\" -type f; fi'",
-                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                        remove=True,
-                        detach=False
-                    ).decode('utf-8').strip().split('\n')
-                    
-                    for file_path in searched_list:
-                        if file_path.strip() and file_path.endswith('.md'):
-                            file_container = docker_client.containers.run(
-                                "alpine:latest",
-                                command=f"cat {file_path}",
-                                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                                remove=True,
-                                detach=False
-                            )
-                            content = file_container.decode('utf-8')
-                            filename = f"searched/{os.path.basename(file_path)}"
-                            zipf.writestr(filename, content)
-                except:
-                    pass
-                
-                # Add filtered articles
-                try:
-                    filtered_list = docker_client.containers.run(
-                        "alpine:latest",
-                        command=f"sh -c 'if [ -d /data/{ticker}/filtered ]; then find /data/{ticker}/filtered -name \"*.md\" -o -name \"*.csv\" -type f; fi'",
-                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                        remove=True,
-                        detach=False
-                    ).decode('utf-8').strip().split('\n')
-                    
-                    for file_path in filtered_list:
-                        if file_path.strip() and (file_path.endswith('.md') or file_path.endswith('.csv')):
-                            file_container = docker_client.containers.run(
-                                "alpine:latest",
-                                command=f"cat {file_path}",
-                                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                                remove=True,
-                                detach=False
-                            )
-                            content = file_container.decode('utf-8')
-                            filename = f"filtered/{os.path.basename(file_path)}"
-                            zipf.writestr(filename, content)
-                except:
-                    pass
-            
-            # Return the comprehensive zip file
-            return FileResponse(
-                zip_path,
-                media_type='application/zip',
-                filename=f"{ticker}_complete_analysis.zip"
-            )
-    
+            except Exception:
+                pass
+
+            # Add searched articles
+            try:
+                searched_result = docker_client.containers.run(
+                    "alpine:latest",
+                    command=f"sh -c 'if [ -d /data/{ticker}/searched ]; then find /data/{ticker}/searched -name \"*.md\" -type f; fi'",
+                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                    remove=True,
+                    detach=False
+                )
+                searched_list = [p.strip() for p in searched_result.decode('utf-8').splitlines() if p.strip().endswith('.md')]
+                for path in searched_list:
+                    try:
+                        content = docker_client.containers.run(
+                            "alpine:latest",
+                            command=f"sh -c 'cat {shlex.quote(path)}'",
+                            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                            remove=True,
+                            detach=False
+                        )
+                        zipf.writestr(f"searched/{os.path.basename(path)}", content)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # Add filtered articles (md + optional csv index)
+            try:
+                filtered_result = docker_client.containers.run(
+                    "alpine:latest",
+                    command=f"sh -c 'if [ -d /data/{ticker}/filtered ]; then find /data/{ticker}/filtered -name \"*.md\" -o -name \"*.csv\" -type f; fi'",
+                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                    remove=True,
+                    detach=False
+                )
+                filtered_list = [p.strip() for p in filtered_result.decode('utf-8').splitlines() if p.strip()]
+                for path in filtered_list:
+                    try:
+                        content = docker_client.containers.run(
+                            "alpine:latest",
+                            command=f"sh -c 'cat {shlex.quote(path)}'",
+                            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                            remove=True,
+                            detach=False
+                        )
+                        subname = os.path.basename(path)
+                        zipf.writestr(f"filtered/{subname}", content)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        buf.seek(0)
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_complete_analysis.zip"'}
+        return StreamingResponse(buf, media_type='application/zip', headers=headers)
+
     except Exception as e:
         logger.error(f"Error creating complete analysis zip for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not create comprehensive zip file: {str(e)}")
@@ -996,27 +1019,25 @@ async def download_all_results(job_id: str):
 
 @app.get("/jobs/{job_id}/files")
 async def list_job_files(job_id: str):
-    """List all available files for a job"""
+    """List counts of available files for a job"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
     ticker = job.get('ticker', '').upper()
-    
+
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker not available")
-    
+
     try:
         files = {
             "info_log": False,
             "screening_report": False,
             "screening_data": False,
-            "searched_articles": [],
-            "filtered_articles": [],
-            "articles_index": False,
-            "filtered_index": False
+            "searched_articles_count": 0,
+            "filtered_articles_count": 0,
         }
-        
+
         # Check info.log
         try:
             docker_client.containers.run(
@@ -1029,7 +1050,7 @@ async def list_job_files(job_id: str):
             files["info_log"] = True
         except:
             pass
-        
+
         # Check screening report
         try:
             docker_client.containers.run(
@@ -1042,7 +1063,7 @@ async def list_job_files(job_id: str):
             files["screening_report"] = True
         except:
             pass
-        
+
         # Check screening data JSON
         try:
             docker_client.containers.run(
@@ -1055,7 +1076,7 @@ async def list_job_files(job_id: str):
             files["screening_data"] = True
         except:
             pass
-        
+
         # List searched articles
         try:
             searched_list = docker_client.containers.run(
@@ -1065,11 +1086,11 @@ async def list_job_files(job_id: str):
                 remove=True,
                 detach=False
             )
-            searched_count = int(searched_list.decode('utf-8').strip())
-            files["searched_articles"] = searched_count
+            searched_count = int((searched_list.decode('utf-8').strip() or "0"))
+            files["searched_articles_count"] = searched_count
         except:
-            files["searched_articles"] = 0
-        
+            files["searched_articles_count"] = 0
+
         # List filtered articles
         try:
             filtered_list = docker_client.containers.run(
@@ -1079,18 +1100,18 @@ async def list_job_files(job_id: str):
                 remove=True,
                 detach=False
             )
-            filtered_count = int(filtered_list.decode('utf-8').strip())
-            files["filtered_articles"] = filtered_count
+            filtered_count = int((filtered_list.decode('utf-8').strip() or "0"))
+            files["filtered_articles_count"] = filtered_count
         except:
-            files["filtered_articles"] = 0
-        
+            files["filtered_articles_count"] = 0
+
         return {
             "job_id": job_id,
             "ticker": ticker,
             "files": files,
             "timestamp": datetime.now().isoformat()
         }
-        
+
     except Exception as e:
         logger.error(f"Error listing files for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not list files: {str(e)}")
@@ -1101,22 +1122,24 @@ async def get_detailed_job_status(job_id: str):
     """Get detailed status including file availability and progress metrics"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     job = jobs[job_id]
-    
+
     # Get file information
     try:
         files_info = await list_job_files(job_id)
         files = files_info.get("files", {})
     except:
         files = {}
-    
+
     # Calculate progress percentage based on completed stages
     progress_percentage = 0
     if job.get("status") == "completed":
         progress_percentage = 100
     elif job.get("status") == "failed":
         progress_percentage = 0
+    elif job.get("status") == "llm_timeout":
+        progress_percentage = 75  # Made it to LLM analysis but timed out
     else:
         # Estimate progress based on stage
         progress_map = {
@@ -1131,7 +1154,7 @@ async def get_detailed_job_status(job_id: str):
             if stage.lower() in current_progress.lower():
                 progress_percentage = percentage
                 break
-    
+
     return {
         "job_id": job_id,
         "ticker": job.get("ticker"),
