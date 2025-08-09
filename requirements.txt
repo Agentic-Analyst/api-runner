@@ -4,6 +4,6 @@ docker==7.1.0
 requests==2.31.0
 python-multipart==0.0.6
 markdown==3.5.1
-pdfkit==1.0.0
+reportlab==4.2.5
 aiofiles==23.2.1
 python-dotenv==1.0.0

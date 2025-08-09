@@ -1,14 +1,15 @@
-FROM mirror.gcr.io/debian:bookworm-slim
+FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Install Python + venv + certs
+# Install Python + development tools for reportlab
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/*
+    python3 python3-pip python3-venv python3-dev ca-certificates curl \
+    build-essential gcc \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create and activate a virtualenv
 RUN python3 -m venv /opt/venv

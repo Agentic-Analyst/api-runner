@@ -41,33 +41,126 @@ export OPENAI_API_KEY="your_openai_key"
 uvicorn main:app --reload --host 0.0.0.0 --port 8080
 ```
 
-### Docker
+### Docker Setup and Management
 
-Build and run with Docker:
+This application uses a multi-container Docker architecture:
+- **API Runner Container**: FastAPI service (this repository)  
+- **Backend Analysis Container**: Stock analysis engine (`stock-analyst:latest` image)
+- **Data Volume**: Persistent storage for analysis results (`stockdata` volume)
+
+#### Initial Setup
+
+1. **Create environment file:**
 ```bash
-# Create .env file with your API keys first
 cp .env.example .env
-# Edit .env file
-
-# Then build and run
-docker ps -a | grep api-runner
-docker stop api-runner && docker rm api-runner
-docker build -t stock-analyst-runner . && echo "Build completed successfully"
-docker run -d -p 8080:8080 -v /var/run/docker.sock:/var/run/docker.sock --env-file .env --name api-runner stock-analyst-runner
+# Edit .env file and add your API keys:
+# SERPAPI_API_KEY=your_serpapi_key_here
+# OPENAI_API_KEY=your_openai_key_here
 ```
 
-### Docker Compose (Recommended)
-
+2. **Create the data volume:**
 ```bash
-# Create .env file with your API keys first
-cp .env.example .env
-# Edit .env file
-
-# Create the external volume
+# This volume persists analysis results across container restarts
 docker volume create stockdata
+```
+
+3. **Ensure backend image exists:**
+```bash
+# Check if the stock analysis backend image is available
+docker images | grep stock-analyst
+
+# If not available, you need to build or pull the stock-analyst image first
+# This image should contain the actual stock analysis pipeline
+```
+
+#### Building and Running the API Runner
+
+**Option 1: Docker Build (Recommended for development)**
+```bash
+# Clean up any existing containers
+docker ps -a | grep api-runner
+docker stop api-runner 2>/dev/null && docker rm api-runner 2>/dev/null
+
+# Build and run the API runner
+docker build -t stock-analyst-runner . && echo "Build completed successfully"
+docker run -d \
+  -p 8080:8080 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v stockdata:/data \
+  --env-file .env \
+  --name api-runner \
+  stock-analyst-runner
+```
+
+**Option 2: Docker Compose (Recommended for production)**
+```bash
+# Create .env file first (as above)
+cp .env.example .env
 
 # Start all services
-docker-compose up --build
+docker-compose up --build -d
+
+# View logs
+docker-compose logs -f api-runner
+```
+
+#### Rebuilding After Code Changes
+
+When you make changes to this repository, rebuild and restart:
+
+```bash
+# Stop the current container
+docker stop api-runner && docker rm api-runner
+
+# Rebuild with no cache to ensure fresh build
+docker build --no-cache -t stock-analyst-runner .
+
+# Restart the container
+docker run -d \
+  -p 8080:8080 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v stockdata:/data \
+  --env-file .env \
+  --name api-runner \
+  stock-analyst-runner
+```
+
+Or with Docker Compose:
+```bash
+# Rebuild and restart
+docker-compose down
+docker-compose up --build -d
+```
+
+#### Docker Architecture Details
+
+**Volume Mounting:**
+- `/var/run/docker.sock` - Allows API runner to control Docker daemon
+- `stockdata:/data` - Persistent data storage for analysis results
+- Backend containers mount `stockdata:/data` for reading/writing analysis files
+
+**Network Flow:**
+1. API Runner receives job requests
+2. API Runner spawns Backend Analysis containers with shared volume
+3. Backend containers write results to `/data/{TICKER}/` directory
+4. API Runner reads results from volume and serves downloads
+
+**Data Structure in Volume:**
+```
+stockdata/
+├── NVDA/                    # One folder per ticker
+│   ├── info.log            # Real-time analysis logs
+│   ├── screening_report.md  # LLM analysis report
+│   ├── screening_data.json  # Structured analysis data
+│   ├── searched/           # Raw scraped articles
+│   │   ├── article_1.md
+│   │   └── article_2.md
+│   └── filtered/           # Filtered articles
+│       ├── filtered_1.md
+│       ├── filtered_2.md
+│       └── filtered_articles_index.csv
+└── AAPL/                   # Another ticker
+    └── ...
 ```
 
 ## API Endpoints
@@ -199,6 +292,116 @@ The API returns different status values to help frontends handle various scenari
 
 ## Troubleshooting
 
+### Docker-Related Issues
+
+**Issue: "Docker client not available" error**
+```bash
+# Check Docker daemon status
+docker --version
+docker ps
+
+# Ensure Docker socket is accessible
+ls -la /var/run/docker.sock
+
+# If using Docker Desktop on macOS, ensure it's running
+```
+
+**Issue: "stock-analyst:latest" image not found**
+```bash
+# Check available images
+docker images | grep stock-analyst
+
+# If missing, you need to build or obtain the backend analysis image
+# This is a separate repository containing the actual stock analysis pipeline
+```
+
+**Issue: Volume permission errors**
+```bash
+# Recreate the data volume
+docker volume rm stockdata
+docker volume create stockdata
+
+# Check volume details
+docker volume inspect stockdata
+```
+
+**Issue: Container fails to start analysis jobs**
+```bash
+# Check API runner logs
+docker logs api-runner
+
+# Verify environment variables are loaded
+docker exec api-runner env | grep -E "(SERPAPI|OPENAI)"
+
+# Test Docker-in-Docker functionality
+docker exec api-runner docker ps
+```
+
+**Issue: Port already in use**
+```bash
+# Find what's using port 8080
+lsof -i :8080
+
+# Kill existing processes
+pkill -f "python.*main.py"
+
+# Or use different port
+docker run -p 8081:8080 ... stock-analyst-runner
+```
+
+**Issue: Analysis results not persisting**
+```bash
+# Verify volume mount
+docker inspect api-runner | grep -A 5 "Mounts"
+
+# Check volume contents
+docker run --rm -v stockdata:/data alpine ls -la /data/
+
+# Verify backend containers can write to volume
+docker run --rm -v stockdata:/data alpine touch /data/test.txt
+```
+
+### Development and Debugging
+
+**View real-time logs:**
+```bash
+# API Runner logs
+docker logs -f api-runner
+
+# Or with Docker Compose
+docker-compose logs -f api-runner
+
+# Analysis job logs (when available)
+curl "http://localhost:8080/jobs/NVDA_20250809_221954/logs/stream"
+```
+
+**Access container shell:**
+```bash
+# Access API runner container
+docker exec -it api-runner bash
+
+# Inspect data volume contents
+docker run --rm -it -v stockdata:/data alpine sh
+ls -la /data/
+```
+
+**Clean slate restart:**
+```bash
+# Stop all containers and clean up
+docker-compose down
+docker stop api-runner 2>/dev/null && docker rm api-runner 2>/dev/null
+
+# Remove old images (optional)
+docker rmi stock-analyst-runner 2>/dev/null
+
+# Remove data volume (WARNING: deletes all analysis results)
+docker volume rm stockdata 2>/dev/null
+
+# Start fresh
+docker volume create stockdata
+docker-compose up --build
+```
+
 ### Common Issues
 
 **LLM Timeouts**: If you encounter `llm_timeout` status, this usually means:
@@ -220,7 +423,106 @@ The API returns different status values to help frontends handle various scenari
 
 ## Environment Variables
 
-- `BACKEND_IMAGE`: Docker image to run for analysis jobs (default: "stock-analyst:latest")
-- `DATA_VOLUME`: Docker volume name for persistent data (default: "stockdata")
-- `SERPAPI_API_KEY`: **Required** - API key for SerpApi web search
-- `OPENAI_API_KEY`: **Required** - API key for OpenAI GPT models
+### Required Configuration
+- `SERPAPI_API_KEY`: **Required** - API key for SerpApi web search service
+  - Get from: https://serpapi.com/
+  - Used by backend analysis containers for web scraping
+  
+- `OPENAI_API_KEY`: **Required** - API key for OpenAI GPT models  
+  - Get from: https://platform.openai.com/api-keys
+  - Used by backend analysis containers for LLM analysis
+
+### Docker Configuration
+- `BACKEND_IMAGE`: Docker image for analysis jobs (default: `stock-analyst:latest`)
+  - This should be the Docker image containing the stock analysis pipeline
+  - Must be available locally or in a accessible registry
+  
+- `DATA_VOLUME`: Docker volume name for persistent data (default: `stockdata`)
+  - Volume where analysis results are stored
+  - Shared between API runner and backend analysis containers
+
+### Example .env File
+```bash
+# Required API Keys
+SERPAPI_API_KEY=your_serpapi_key_here
+OPENAI_API_KEY=sk-your_openai_key_here
+
+# Optional Docker Configuration
+BACKEND_IMAGE=stock-analyst:latest
+DATA_VOLUME=stockdata
+```
+
+### Configuration Validation
+
+Check if your configuration is correct:
+```bash
+# Test API runner health
+curl http://localhost:8080/health
+
+# Expected response:
+{
+  "status": "healthy",
+  "docker": "connected",
+  "backend_image": "stock-analyst:latest", 
+  "data_volume": "stockdata",
+  "api_keys_configured": {
+    "serpapi": true,
+    "openai": true
+  }
+}
+```
+
+## Quick Reference
+
+### Essential Docker Commands
+
+```bash
+# Initial setup (run once)
+docker volume create stockdata
+cp .env.example .env  # Edit with your API keys
+
+# Daily development workflow
+docker stop api-runner && docker rm api-runner          # Stop current
+docker build -t stock-analyst-runner .                  # Rebuild 
+docker run -d -p 8080:8080 \                           # Start fresh
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v stockdata:/data \
+  --env-file .env --name api-runner stock-analyst-runner
+
+# Check status
+curl http://localhost:8080/health                       # API health
+docker logs api-runner                                  # View logs
+docker exec api-runner docker ps                       # Test Docker access
+```
+
+### Analysis Job Workflow
+
+```bash
+# Start analysis
+curl -X POST http://localhost:8080/run \
+  -H "Content-Type: application/json" \
+  -d '{"ticker": "NVDA", "pipeline": "full"}'
+
+# Monitor progress  
+curl http://localhost:8080/jobs/NVDA_20250809_221954
+curl -N http://localhost:8080/jobs/NVDA_20250809_221954/logs/stream
+
+# Download results
+curl http://localhost:8080/jobs/NVDA_20250809_221954/download/screening-report \
+  -o nvda_report.md
+```
+
+### Data Volume Management
+
+```bash
+# Inspect volume contents
+docker run --rm -v stockdata:/data alpine ls -la /data/
+
+# Backup analysis results
+docker run --rm -v stockdata:/data -v $(pwd):/backup alpine \
+  tar czf /backup/stockdata_backup.tar.gz -C /data .
+
+# Restore from backup
+docker run --rm -v stockdata:/data -v $(pwd):/backup alpine \
+  tar xzf /backup/stockdata_backup.tar.gz -C /data
+```

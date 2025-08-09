@@ -23,6 +23,9 @@ import zipfile
 import shutil
 from io import BytesIO
 import shlex
+import markdown
+import subprocess
+import uuid
 
 import docker
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -869,17 +872,21 @@ async def download_filtered_articles(job_id: str):
 
 @app.get("/jobs/{job_id}/download/screening-report")
 async def download_screening_report(job_id: str):
-    """Download the screening_report.md file (in-memory)"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    job = jobs[job_id]
-    ticker = job.get('ticker', '').upper()
-
+    """Download the screening_report.md file as a PDF (converted in-memory)"""
+    # Try to get job info, but fall back to extracting ticker from job_id if not found
+    if job_id in jobs:
+        job = jobs[job_id]
+        ticker = job.get('ticker', '').upper()
+    else:
+        # Extract ticker from job_id (format is usually TICKER_YYYYMMDD_HHMMSS)
+        ticker_part = job_id.split('_')[0] if '_' in job_id else job_id
+        ticker = ticker_part.upper()
+        logger.warning(f"Job {job_id} not found in memory, trying with ticker: {ticker}")
+    
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker not available")
-
     try:
+        # 1. Fetch .md file from volume (docker)
         result = docker_client.containers.run(
             "alpine:latest",
             command=f"sh -c 'cat /data/{ticker}/screening_report.md'",
@@ -889,16 +896,96 @@ async def download_screening_report(job_id: str):
         )
         if not result:
             raise HTTPException(status_code=404, detail="Screening report not found")
+        md_content = result.decode('utf-8')
 
-        headers = {"Content-Disposition": f'attachment; filename=\"{ticker}_screening_report.md\"'}
-        return StreamingResponse(BytesIO(result), media_type='text/markdown', headers=headers)
+        # 2. Convert Markdown to HTML
+        import markdown
+        html_content = markdown.markdown(md_content, output_format="html5")
 
+        # 3. Convert HTML to PDF using ReportLab
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import letter
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from io import BytesIO
+        import re
+        
+        buffer = BytesIO()
+        
+        # Create PDF document
+        doc = SimpleDocTemplate(buffer, pagesize=letter, 
+                              topMargin=1*inch, bottomMargin=1*inch,
+                              leftMargin=1*inch, rightMargin=1*inch)
+        
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle('CustomTitle', parent=styles['Title'], 
+                                   fontSize=24, spaceAfter=30, textColor='darkblue')
+        heading_style = ParagraphStyle('CustomHeading', parent=styles['Heading1'], 
+                                     fontSize=16, spaceAfter=12, textColor='darkblue')
+        
+        # Build story (content for PDF)
+        story = []
+        
+        # Add title
+        story.append(Paragraph(f"{ticker} Stock Analysis Report", title_style))
+        story.append(Spacer(1, 20))
+        
+        # Parse HTML content and convert to ReportLab elements
+        # This is a simplified conversion - for better results, consider using a proper HTML parser
+        lines = html_content.split('\n')
+        current_paragraph = ""
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                if current_paragraph:
+                    # Clean up HTML tags for basic conversion
+                    clean_text = re.sub(r'<[^>]+>', '', current_paragraph)
+                    if clean_text.strip():
+                        story.append(Paragraph(clean_text, styles['Normal']))
+                        story.append(Spacer(1, 12))
+                    current_paragraph = ""
+                continue
+                
+            # Handle headings
+            if line.startswith('<h'):
+                if current_paragraph:
+                    clean_text = re.sub(r'<[^>]+>', '', current_paragraph)
+                    if clean_text.strip():
+                        story.append(Paragraph(clean_text, styles['Normal']))
+                        story.append(Spacer(1, 12))
+                    current_paragraph = ""
+                
+                clean_heading = re.sub(r'<[^>]+>', '', line)
+                if clean_heading.strip():
+                    story.append(Paragraph(clean_heading, heading_style))
+                    story.append(Spacer(1, 6))
+            else:
+                current_paragraph += " " + line
+        
+        # Add any remaining paragraph
+        if current_paragraph:
+            clean_text = re.sub(r'<[^>]+>', '', current_paragraph)
+            if clean_text.strip():
+                story.append(Paragraph(clean_text, styles['Normal']))
+        
+        # Build PDF
+        try:
+            doc.build(story)
+            pdf_bytes = buffer.getvalue()
+            buffer.close()
+        except Exception as e:
+            buffer.close()
+            raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
+
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_screening_report.pdf"'}
+        return StreamingResponse(BytesIO(pdf_bytes), media_type='application/pdf', headers=headers)
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error downloading screening report for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not read screening report: {str(e)}")
-
+        logger.error(f"Error downloading converted PDF screening report for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read or convert screening report: {str(e)}")
 
 @app.get("/jobs/{job_id}/download/all-results")
 async def download_all_results(job_id: str):
