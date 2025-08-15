@@ -2,15 +2,15 @@ version: '3.8'
 
 services:
   api-runner:
-    image: stock-analyst-runner:latest
-    build: .
+    image: fuzanwenn/api-runner:latest
+    container_name: stock-analyst-api-runner
     ports:
       - "8080:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - stockdata:/data
     environment:
-      - BACKEND_IMAGE=stock-analyst:latest
+      - BACKEND_IMAGE=fuzanwenn/stock-analyst:latest
       - DATA_VOLUME=stockdata
       - DOCKER_HOST=unix:///var/run/docker.sock
       - SERPAPI_API_KEY=${SERPAPI_API_KEY}
@@ -18,18 +18,11 @@ services:
     env_file:
       - .env
     restart: unless-stopped
-    # Run as root to access Docker socket
-    user: "0:0"
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
 
 volumes:
   stockdata:
-    external: true
-  redis_data:
+    driver: local
+
+networks:
+  default:
+    driver: bridge
