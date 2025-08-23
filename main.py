@@ -1104,6 +1104,154 @@ async def download_all_results(job_id: str):
         raise HTTPException(status_code=500, detail=f"Could not create comprehensive zip file: {str(e)}")
 
 
+@app.get("/jobs/{job_id}/download/financials-annual")
+async def download_financials_annual(job_id: str):
+    """Download the financials_annual_modeling_latest.json file"""
+    # Try to get job info, but fall back to extracting ticker from job_id if not found
+    if job_id in jobs:
+        job = jobs[job_id]
+        ticker = job.get('ticker', '').upper()
+    else:
+        # Extract ticker from job_id (format is usually TICKER_YYYYMMDD_HHMMSS)
+        ticker_part = job_id.split('_')[0] if '_' in job_id else job_id
+        ticker = ticker_part.upper()
+        logger.warning(f"Job {job_id} not found in memory, trying with ticker: {ticker}")
+    
+    if not docker_client:
+        raise HTTPException(status_code=503, detail="Docker not available")
+    
+    try:
+        # Read the financials annual JSON file
+        result = docker_client.containers.run(
+            "alpine:latest",
+            command=f"sh -c 'cat /data/{ticker}/financials/financials_annual_modeling_latest.json'",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            remove=True,
+            detach=False
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Financials annual JSON not found")
+
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_financials_annual_modeling_latest.json"'}
+        return StreamingResponse(BytesIO(result), media_type='application/json', headers=headers)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading financials annual for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read financials annual file: {str(e)}")
+
+
+@app.get("/jobs/{job_id}/download/financial-model")
+async def download_financial_model(job_id: str):
+    """Download the financial_model_comprehensive_latest.xlsx file"""
+    # Try to get job info, but fall back to extracting ticker from job_id if not found
+    if job_id in jobs:
+        job = jobs[job_id]
+        ticker = job.get('ticker', '').upper()
+    else:
+        # Extract ticker from job_id (format is usually TICKER_YYYYMMDD_HHMMSS)
+        ticker_part = job_id.split('_')[0] if '_' in job_id else job_id
+        ticker = ticker_part.upper()
+        logger.warning(f"Job {job_id} not found in memory, trying with ticker: {ticker}")
+    
+    if not docker_client:
+        raise HTTPException(status_code=503, detail="Docker not available")
+    
+    try:
+        # Read the financial model Excel file
+        result = docker_client.containers.run(
+            "alpine:latest",
+            command=f"sh -c 'cat /data/{ticker}/models/financial_model_comprehensive_latest.xlsx'",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            remove=True,
+            detach=False
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Financial model Excel not found")
+
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_financial_model_comprehensive_latest.xlsx"'}
+        return StreamingResponse(BytesIO(result), media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers=headers)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading financial model for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read financial model file: {str(e)}")
+
+
+@app.get("/jobs/{job_id}/download/filtered-report")
+async def download_filtered_report(job_id: str):
+    """Download the filtered_report.md file"""
+    # Try to get job info, but fall back to extracting ticker from job_id if not found
+    if job_id in jobs:
+        job = jobs[job_id]
+        ticker = job.get('ticker', '').upper()
+    else:
+        # Extract ticker from job_id (format is usually TICKER_YYYYMMDD_HHMMSS)
+        ticker_part = job_id.split('_')[0] if '_' in job_id else job_id
+        ticker = ticker_part.upper()
+        logger.warning(f"Job {job_id} not found in memory, trying with ticker: {ticker}")
+    
+    if not docker_client:
+        raise HTTPException(status_code=503, detail="Docker not available")
+    
+    try:
+        # Read the filtered report markdown file
+        result = docker_client.containers.run(
+            "alpine:latest",
+            command=f"sh -c 'cat /data/{ticker}/filtered_report.md'",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            remove=True,
+            detach=False
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Filtered report not found")
+
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_filtered_report.md"'}
+        return StreamingResponse(BytesIO(result), media_type='text/markdown', headers=headers)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading filtered report for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read filtered report file: {str(e)}")
+
+
+@app.get("/jobs/{job_id}/download/price-adjustment-explanation")
+async def download_price_adjustment_explanation(job_id: str):
+    """Download the price_adjustment_explanation_latest.md file"""
+    # Try to get job info, but fall back to extracting ticker from job_id if not found
+    if job_id in jobs:
+        job = jobs[job_id]
+        ticker = job.get('ticker', '').upper()
+    else:
+        # Extract ticker from job_id (format is usually TICKER_YYYYMMDD_HHMMSS)
+        ticker_part = job_id.split('_')[0] if '_' in job_id else job_id
+        ticker = ticker_part.upper()
+        logger.warning(f"Job {job_id} not found in memory, trying with ticker: {ticker}")
+    
+    if not docker_client:
+        raise HTTPException(status_code=503, detail="Docker not available")
+    
+    try:
+        # Read the price adjustment explanation markdown file
+        result = docker_client.containers.run(
+            "alpine:latest",
+            command=f"sh -c 'cat /data/{ticker}/models/price_adjustment_explanation_latest.md'",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            remove=True,
+            detach=False
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Price adjustment explanation not found")
+
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_price_adjustment_explanation_latest.md"'}
+        return StreamingResponse(BytesIO(result), media_type='text/markdown', headers=headers)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading price adjustment explanation for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read price adjustment explanation file: {str(e)}")
+
+
 @app.get("/jobs/{job_id}/files")
 async def list_job_files(job_id: str):
     """List counts of available files for a job"""
@@ -1123,6 +1271,10 @@ async def list_job_files(job_id: str):
             "screening_data": False,
             "searched_articles_count": 0,
             "filtered_articles_count": 0,
+            "financials_annual": False,
+            "financial_model": False,
+            "filtered_report": False,
+            "price_adjustment_explanation": False,
         }
 
         # Check info.log
@@ -1191,6 +1343,58 @@ async def list_job_files(job_id: str):
             files["filtered_articles_count"] = filtered_count
         except:
             files["filtered_articles_count"] = 0
+
+        # Check financials annual JSON
+        try:
+            docker_client.containers.run(
+                "alpine:latest",
+                command=f"test -f /data/{ticker}/financials/financials_annual_modeling_latest.json",
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                remove=True,
+                detach=False
+            )
+            files["financials_annual"] = True
+        except:
+            pass
+
+        # Check financial model Excel
+        try:
+            docker_client.containers.run(
+                "alpine:latest",
+                command=f"test -f /data/{ticker}/models/financial_model_comprehensive_latest.xlsx",
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                remove=True,
+                detach=False
+            )
+            files["financial_model"] = True
+        except:
+            pass
+
+        # Check filtered report
+        try:
+            docker_client.containers.run(
+                "alpine:latest",
+                command=f"test -f /data/{ticker}/filtered_report.md",
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                remove=True,
+                detach=False
+            )
+            files["filtered_report"] = True
+        except:
+            pass
+
+        # Check price adjustment explanation
+        try:
+            docker_client.containers.run(
+                "alpine:latest",
+                command=f"test -f /data/{ticker}/models/price_adjustment_explanation_latest.md",
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                remove=True,
+                detach=False
+            )
+            files["price_adjustment_explanation"] = True
+        except:
+            pass
 
         return {
             "job_id": job_id,
