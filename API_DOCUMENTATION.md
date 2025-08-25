@@ -55,7 +55,7 @@ Detailed health check with system status.
 ### 2. Start Analysis Job
 
 #### `POST /run`
-Starts a new stock analysis job.
+Starts a new stock analysis job with comprehensive financial modeling options.
 
 **Request Body:**
 ```json
@@ -63,15 +63,48 @@ Starts a new stock analysis job.
   "ticker": "NVDA",
   "company": "NVIDIA Corporation",
   "query": "recent earnings performance",
-  "pipeline": "full"
+  "pipeline": "comprehensive",
+  "model": "dcf",
+  "years": 5,
+  "term_growth": 2.5,
+  "wacc": 8.5,
+  "strategy": "aggressive",
+  "max_articles": 50,
+  "min_score": 0.7,
+  "scaling": "moderate",
+  "adjustment_cap": 15.0
 }
 ```
 
 **Parameters:**
 - `ticker` (required): Stock ticker symbol
 - `company` (optional): Company name (auto-inferred if not provided)
-- `query` (optional): Custom search query
-- `pipeline` (optional): Analysis pipeline type, default "full"
+- `query` (optional): Custom search query for article filtering
+- `pipeline` (optional): Analysis pipeline type
+  - `"comprehensive"` (default): Full analysis with all components
+  - `"financial-only"`: Financial analysis only
+  - `"model-only"`: Financial modeling only
+  - `"news-only"`: News analysis only  
+  - `"model-to-price"`: Financial model to price target
+  - `"news-to-price"`: News sentiment to price impact
+- `model` (optional): Financial model type
+  - `"dcf"` (default): Discounted Cash Flow analysis
+  - `"comparable"`: Comparable company analysis
+  - `"comprehensive"`: Combined DCF and comparable analysis
+- `years` (optional): Projection years for financial modeling (default: 5)
+- `term_growth` (optional): Terminal growth rate % (default: 2.5)
+- `wacc` (optional): Weighted Average Cost of Capital % (default: 8.0)
+- `strategy` (optional): Analysis strategy
+  - `"conservative"`: Conservative assumptions
+  - `"moderate"` (default): Balanced assumptions
+  - `"aggressive"`: Growth-focused assumptions
+- `max_articles` (optional): Maximum articles to analyze (default: 30)
+- `min_score` (optional): Minimum relevance score for articles (default: 0.5)
+- `scaling` (optional): Revenue scaling assumptions
+  - `"conservative"`: Low growth scaling
+  - `"moderate"` (default): Balanced scaling
+  - `"aggressive"`: High growth scaling
+- `adjustment_cap` (optional): Maximum price adjustment % (default: 20.0)
 
 **Response:**
 ```json
@@ -135,8 +168,12 @@ Get comprehensive status including file availability and progress metrics.
     "info_log": true,
     "screening_report": true,
     "screening_data": true,
-    "searched_articles": 9,
-    "filtered_articles": 8
+    "searched_articles_count": 9,
+    "filtered_articles_count": 8,
+    "financials_annual": true,
+    "financial_model": true,
+    "filtered_report": true,
+    "price_adjustment_explanation": true
   },
   "recent_logs_count": 45,
   "latest_log": "PIPELINE SESSION COMPLETED successfully"
@@ -265,10 +302,12 @@ List all available files for a completed job.
     "info_log": true,
     "screening_report": true,
     "screening_data": true,
-    "searched_articles": 9,
-    "filtered_articles": 8,
-    "articles_index": true,
-    "filtered_index": true
+    "searched_articles_count": 9,
+    "filtered_articles_count": 8,
+    "financials_annual": true,
+    "financial_model": true,
+    "filtered_report": true,
+    "price_adjustment_explanation": true
   },
   "timestamp": "2025-08-07T14:45:30.123456"
 }
@@ -298,6 +337,37 @@ Download the main screening report.
 **Filename:** `{TICKER}_screening_report.md`
 **Content-Type:** `text/markdown`
 
+#### `GET /jobs/{job_id}/download/financials-annual`
+Download annual financials data in JSON format.
+
+**Response:** JSON file
+**Filename:** `{TICKER}_financials_annual_modeling_latest.json`
+**Content-Type:** `application/json`
+**Location:** `financials/` directory
+
+#### `GET /jobs/{job_id}/download/financial-model`
+Download comprehensive financial model as Excel file.
+
+**Response:** Excel file
+**Filename:** `{TICKER}_financial_model_comprehensive_latest.xlsx`
+**Content-Type:** `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+**Location:** `models/` directory
+
+#### `GET /jobs/{job_id}/download/filtered-report`
+Download filtered analysis report.
+
+**Response:** Markdown file
+**Filename:** `{TICKER}_filtered_report.md`
+**Content-Type:** `text/markdown`
+
+#### `GET /jobs/{job_id}/download/price-adjustment-explanation`
+Download price adjustment explanation and methodology.
+
+**Response:** Markdown file
+**Filename:** `{TICKER}_price_adjustment_explanation_latest.md`
+**Content-Type:** `text/markdown`
+**Location:** `models/` directory
+
 #### `GET /jobs/{job_id}/download/all-results`
 Download complete analysis results as a comprehensive ZIP.
 
@@ -309,6 +379,8 @@ Download complete analysis results as a comprehensive ZIP.
 - `screening_data.json` - Structured analysis data
 - `searched/` folder - All scraped articles
 - `filtered/` folder - Filtered articles and index
+- `financials/` folder - Annual financials JSON data
+- `models/` folder - Financial models and price explanations
 
 #### `GET /jobs/{job_id}/info-log`
 Get the complete info.log content as JSON.
@@ -336,16 +408,33 @@ class StockAnalysisAPI {
   }
 
   // Start new analysis
-  async startAnalysis(ticker, company = null, query = null) {
+  async startAnalysis(ticker, company = null, query = null, options = {}) {
+    const requestBody = { 
+      ticker, 
+      ...company && { company },
+      ...query && { query }
+    };
+    
+    // Add optional financial modeling parameters
+    const validOptions = [
+      'pipeline', 'model', 'years', 'term_growth', 'wacc', 
+      'strategy', 'max_articles', 'min_score', 'scaling', 'adjustment_cap'
+    ];
+    
+    validOptions.forEach(key => {
+      if (options[key] !== undefined) {
+        requestBody[key] = options[key];
+      }
+    });
+    
+    // Set defaults if not specified
+    if (!requestBody.pipeline) requestBody.pipeline = 'comprehensive';
+    if (!requestBody.model) requestBody.model = 'dcf';
+    
     const response = await fetch(`${this.baseUrl}/run`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        ticker, 
-        company, 
-        query, 
-        pipeline: 'full' 
-      })
+      body: JSON.stringify(requestBody)
     });
     
     if (!response.ok) {
@@ -426,8 +515,18 @@ class StockAnalysisAPI {
 ```javascript
 const api = new StockAnalysisAPI();
 
-// Start analysis
-const jobResponse = await api.startAnalysis('NVDA', 'NVIDIA Corporation');
+// Start comprehensive analysis with financial modeling
+const jobResponse = await api.startAnalysis('NVDA', 'NVIDIA Corporation', null, {
+  pipeline: 'comprehensive',
+  model: 'dcf',
+  years: 5,
+  term_growth: 2.5,
+  wacc: 8.5,
+  strategy: 'moderate',
+  max_articles: 40,
+  min_score: 0.6
+});
+
 const jobId = jobResponse.job_id;
 
 // Monitor progress with real-time updates
@@ -455,9 +554,21 @@ const eventSource = api.monitorJob(jobId, {
   }
 });
 
-// Download results when completed
+// Download various file types when completed
 document.getElementById('download-report').onclick = () => {
   api.downloadFile(jobId, 'screening-report');
+};
+
+document.getElementById('download-financials').onclick = () => {
+  api.downloadFile(jobId, 'financials-annual');
+};
+
+document.getElementById('download-model').onclick = () => {
+  api.downloadFile(jobId, 'financial-model');
+};
+
+document.getElementById('download-price-explanation').onclick = () => {
+  api.downloadFile(jobId, 'price-adjustment-explanation');
 };
 
 document.getElementById('download-all').onclick = () => {
@@ -467,16 +578,143 @@ document.getElementById('download-all').onclick = () => {
 
 ---
 
+## Pipeline Options and Financial Modeling
+
+### Analysis Pipelines
+
+The API supports multiple analysis pipelines to meet different use cases:
+
+#### `comprehensive` (Default)
+- Complete financial analysis with DCF modeling
+- News sentiment analysis and article filtering
+- Price target calculations with adjustment explanations
+- Full model outputs including Excel files and detailed reports
+
+#### `financial-only`
+- Focus on financial data analysis
+- Annual financials processing and modeling
+- Financial ratios and trend analysis
+- No news/article analysis
+
+#### `model-only`
+- Pure financial modeling without data scraping
+- DCF and comparable company analysis
+- Excel model generation
+- Price target calculations
+
+#### `news-only`
+- News sentiment analysis only
+- Article scraping and filtering
+- Sentiment scoring and reporting
+- No financial modeling
+
+#### `model-to-price`
+- Financial model to price target pipeline
+- Focus on valuation outputs
+- Price adjustment explanations
+- Streamlined for price-focused analysis
+
+#### `news-to-price`
+- News sentiment to price impact analysis
+- Sentiment-driven price adjustments
+- Market reaction modeling
+- News-based price target modifications
+
+### Financial Modeling Parameters
+
+#### Model Types
+- **`dcf`**: Discounted Cash Flow analysis with terminal value calculations
+- **`comparable`**: Comparable company analysis using industry multiples
+- **`comprehensive`**: Combined DCF and comparable analysis for validation
+
+#### Analysis Strategies
+- **`conservative`**: Lower growth assumptions, higher discount rates
+- **`moderate`**: Balanced assumptions based on historical performance
+- **`aggressive`**: Higher growth projections, optimistic scenarios
+
+#### Scaling Options
+- **`conservative`**: 10-15% revenue growth assumptions
+- **`moderate`**: 15-25% revenue growth assumptions  
+- **`aggressive`**: 25%+ revenue growth assumptions
+
+### Parameter Guidelines
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `years` | 5 | 3-10 | Projection period for DCF model |
+| `term_growth` | 2.5% | 1.0-4.0% | Terminal growth rate assumption |
+| `wacc` | 8.0% | 5.0-15.0% | Weighted average cost of capital |
+| `max_articles` | 30 | 10-100 | Maximum articles to analyze |
+| `min_score` | 0.5 | 0.1-0.9 | Minimum relevance score threshold |
+| `adjustment_cap` | 20.0% | 5.0-50.0% | Maximum price adjustment percentage |
+
+---
+
 ## Progress Stages
 
-The API tracks these main progress stages:
+The API tracks these main progress stages depending on the selected pipeline:
 
+### Comprehensive Pipeline
+1. **Pipeline initialized** (0-5%)
+2. **Scraping articles** (5-20%)
+3. **Filtering articles** (20-35%) 
+4. **Processing financials** (35-50%)
+5. **Running LLM analysis** (50-70%)
+6. **Building financial model** (70-85%)
+7. **Generating reports** (85-95%)
+8. **Pipeline session completed** (100%)
+
+### Financial-Only Pipeline
 1. **Pipeline initialized** (0-10%)
-2. **Scraping articles** (10-25%)
-3. **Filtering articles** (25-50%) 
-4. **Running LLM analysis** (50-90%)
-5. **Generating reports** (90-95%)
-6. **Pipeline session completed** (100%)
+2. **Processing financials** (10-40%)
+3. **Building financial model** (40-80%)
+4. **Generating reports** (80-95%)
+5. **Pipeline session completed** (100%)
+
+### Model-Only Pipeline
+1. **Pipeline initialized** (0-15%)
+2. **Building financial model** (15-80%)
+3. **Calculating price targets** (80-95%)
+4. **Pipeline session completed** (100%)
+
+---
+
+## File Structure and Organization
+
+The API organizes generated files in a structured directory hierarchy:
+
+```
+/data/{TICKER}/
+├── info.log                              # Complete analysis logs
+├── screening_report.md                   # Main screening report  
+├── screening_data.json                  # Structured analysis data
+├── filtered_report.md                   # Filtered analysis report
+├── searched/                            # Raw scraped articles
+│   ├── article_001.md
+│   ├── article_002.md
+│   └── ...
+├── filtered/                           # Filtered articles with scores
+│   ├── filtered_01_score_8.5_article.md
+│   ├── filtered_02_score_7.2_article.md
+│   ├── filtered_articles_index.csv
+│   └── ...
+├── financials/                         # Financial data files
+│   ├── financials_annual_modeling_latest.json
+│   ├── financial_ratios_analysis.json
+│   └── ...
+└── models/                             # Financial models and explanations
+    ├── financial_model_comprehensive_latest.xlsx
+    ├── price_adjustment_explanation_latest.md
+    ├── dcf_model_detailed.xlsx
+    └── ...
+```
+
+### File Naming Conventions
+
+- **Timestamped files**: Include `_latest` suffix for most recent version
+- **Filtered articles**: Named as `filtered_{number}_score_{score}_{title}.md`
+- **Model files**: Include model type and analysis date in filename
+- **Financial data**: Organized by data type and frequency (annual, quarterly)
 
 ---
 

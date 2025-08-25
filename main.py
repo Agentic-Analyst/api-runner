@@ -23,15 +23,16 @@ import zipfile
 import shutil
 from io import BytesIO
 import shlex
-import markdown
 import subprocess
 import uuid
+import markdown
+
 
 import docker
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import aiofiles
 import uvicorn
 
@@ -75,14 +76,26 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Pydantic models
 class JobRequest(BaseModel):
-    ticker: str
-    company: Optional[str] = None
-    query: Optional[str] = None
-    pipeline: Optional[str] = "full"
-    max_articles: Optional[int] = None
-    min_score: Optional[float] = None
-    max_filtered: Optional[int] = None
-    min_confidence: Optional[float] = None
+    """Request model for running stock analysis jobs.
+    
+    Only ticker and company are required - all other parameters use main.py defaults.
+    Since we always use mapped deltas and LLM scenarios in production, these are not exposed.
+    """
+    ticker: str = Field(..., description="Stock ticker symbol (e.g., NVDA)")
+    company: str = Field(..., description="Company name (e.g., 'NVIDIA')")
+    # Optional parameters - main.py provides all defaults
+    pipeline: Optional[str] = Field(default=None, description="Pipeline to run (default: comprehensive)")
+    model: Optional[str] = Field(default=None, description="Financial model type (default: comprehensive)")
+    years: Optional[int] = Field(default=None, description="Projection years (default: 5)")
+    term_growth: Optional[float] = Field(default=None, description="Terminal growth rate (auto-inferred)")
+    wacc: Optional[float] = Field(default=None, description="Override WACC (auto-inferred)")
+    strategy: Optional[str] = Field(default=None, description="Force specific forecast strategy")
+    max_articles: Optional[int] = Field(default=None, description="Maximum articles to scrape (default: 20)")
+    min_score: Optional[float] = Field(default=None, description="Minimum relevance score (default: 3.0)")
+    max_filtered: Optional[int] = Field(default=None, description="Maximum filtered articles (default: 10)")
+    min_confidence: Optional[float] = Field(default=None, description="Minimum confidence (default: 0.5)")
+    scaling: Optional[float] = Field(default=None, description="Base scaling factor (default: 0.15)")
+    adjustment_cap: Optional[float] = Field(default=None, description="Maximum adjustment % (default: 0.20)")
 
 class JobResponse(BaseModel):
     job_id: str
@@ -266,10 +279,19 @@ async def monitor_info_log(job_id: str, container):
         logger.error(f"Error monitoring logs for job {job_id}: {e}")
 
 
-async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = None, query: Optional[str] = None, 
-                         pipeline: str = "full", max_articles: Optional[int] = None, min_score: Optional[float] = None, 
-                         max_filtered: Optional[int] = None, min_confidence: Optional[float] = None):
-    """Run stock analysis job in Docker container with real-time monitoring"""
+async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = None, 
+                         pipeline: Optional[str] = None, model: Optional[str] = None, 
+                         years: Optional[int] = None, term_growth: Optional[float] = None,
+                         wacc: Optional[float] = None, strategy: Optional[str] = None,
+                         max_articles: Optional[int] = None, min_score: Optional[float] = None, 
+                         max_filtered: Optional[int] = None, min_confidence: Optional[float] = None,
+                         scaling: Optional[float] = None, adjustment_cap: Optional[float] = None):
+    """
+    Run stock analysis job in Docker container.
+    
+    All parameters except ticker and company are optional - main.py provides sensible defaults.
+    Mapped deltas and LLM scenarios are always enabled in production.
+    """
     if not docker_client:
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = "Docker client not available"
@@ -302,9 +324,23 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = No
             }
             company = company_map.get(ticker.upper(), f"{ticker.upper()} Corporation")
 
-        cmd = ["--ticker", ticker, "--company", company, "--pipeline", pipeline]
-        if query:
-            cmd.extend(["--search-query", query])
+        cmd = ["--ticker", ticker, "--company", company]
+        
+        # Only add optional parameters if they're provided (not None)
+        if pipeline:
+            cmd.extend(["--pipeline", pipeline])
+        if model:
+            cmd.extend(["--model", model])
+        if years is not None:
+            cmd.extend(["--years", str(years)])
+        if term_growth is not None:
+            cmd.extend(["--term-growth", str(term_growth)])
+        if wacc is not None:
+            cmd.extend(["--wacc", str(wacc)])
+        if strategy:
+            cmd.extend(["--strategy", strategy])
+        
+        # Add news analysis parameters if provided
         if max_articles is not None:
             cmd.extend(["--max-articles", str(max_articles)])
         if min_score is not None:
@@ -313,6 +349,13 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str] = No
             cmd.extend(["--max-filtered", str(max_filtered)])
         if min_confidence is not None:
             cmd.extend(["--min-confidence", str(min_confidence)])
+        
+        # Add price adjustment parameters if provided
+        if scaling is not None:
+            cmd.extend(["--scaling", str(scaling)])
+        if adjustment_cap is not None:
+            cmd.extend(["--adjustment-cap", str(adjustment_cap)])
+        # Mapped deltas and LLM scenarios are always enabled - no parameters needed
 
         logger.info(f"🚀 Starting analysis for {ticker} ({company}) with command: {cmd}")
         jobs[job_id]["progress"] = f"Running {pipeline} analysis for {ticker} ({company})..."
@@ -473,12 +516,20 @@ async def start_analysis(request: JobRequest, background_tasks: BackgroundTasks)
     Parameters:
     - ticker: Stock ticker symbol (e.g., "NVDA")
     - company: Company name (optional, will be inferred if not provided)
-    - query: Custom search query (optional)
-    - pipeline: Analysis pipeline ("full", "scrape-only", "filter-only", "screen-only", "filter-screen")
-    - max_articles: Maximum articles to scrape (optional, default: 20)
-    - min_score: Minimum relevance score for filtering (optional, default: 3.0)
-    - max_filtered: Maximum filtered articles to keep (optional, default: 10)
-    - min_confidence: Minimum confidence for LLM insights (optional, default: 0.5)
+    - pipeline: Analysis pipeline ("comprehensive", "financial-only", "model-only", "news-only", "model-to-price", "news-to-price")
+    - model: Financial model type ("dcf", "comparable", "comprehensive")
+    - years: Projection years (default: 5)
+    - term_growth: Terminal growth rate (optional, auto-inferred)
+    - wacc: Override WACC (optional, auto-inferred)  
+    - strategy: Force specific forecast strategy (optional)
+    - max_articles: Maximum articles to scrape (default: 20)
+    - min_score: Minimum relevance score for filtering (default: 3.0)
+    - max_filtered: Maximum filtered articles to keep (default: 10)
+    - min_confidence: Minimum confidence for LLM insights (default: 0.5)
+    - scaling: Base scaling factor for qualitative adjustment (default: 0.15)
+    - adjustment_cap: Maximum adjustment percentage ± (default: 0.20)
+    - use_mapped_deltas: Use deterministic event→parameter mapping (default: true)
+    - use_llm_scenarios: Use LLM scenario analysis (default: true)
     """
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker service not available")
@@ -499,9 +550,12 @@ async def start_analysis(request: JobRequest, background_tasks: BackgroundTasks)
         "progress": "Job queued"
     }
 
-    # Start background task
-    background_tasks.add_task(run_analysis_job, job_id, request.ticker, request.company, request.query, request.pipeline,
-                             request.max_articles, request.min_score, request.max_filtered, request.min_confidence)
+    # Start background task - all parameters are optional except ticker/company
+    background_tasks.add_task(run_analysis_job, job_id, request.ticker, request.company, 
+                             request.pipeline, request.model, request.years, request.term_growth, 
+                             request.wacc, request.strategy, request.max_articles, request.min_score, 
+                             request.max_filtered, request.min_confidence, request.scaling, 
+                             request.adjustment_cap)
 
     return JobResponse(
         job_id=job_id,
@@ -680,7 +734,7 @@ async def get_job_logs_stream(job_id: str):
 async def download_file(job_id: str, filename: str):
     """
     Download a specific top-level file from job results.
-    Supported: info.log, screening_report.md, screening_data.json
+    Supported: info.log, screening_report.md, screening_data.json, price_adjustment_explanation_latest.md
     """
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -693,12 +747,18 @@ async def download_file(job_id: str, filename: str):
 
     supported = {"info.log": "text/plain",
                  "screening_report.md": "text/markdown",
-                 "screening_data.json": "application/json"}
+                 "screening_data.json": "application/json",
+                 "price_adjustment_explanation_latest.md": "text/markdown"}
     if filename not in supported:
-        raise HTTPException(status_code=400, detail=f"Unsupported filename '{filename}'")
+        raise HTTPException(status_code=400, detail=f"Unsupported filename '{filename}'. Supported: {list(supported.keys())}")
 
     try:
-        path = f"/data/{ticker}/{filename}"
+        # Handle files in models subdirectory
+        if filename.startswith("price_adjustment_explanation"):
+            path = f"/data/{ticker}/models/{filename}"
+        else:
+            path = f"/data/{ticker}/{filename}"
+        
         result = docker_client.containers.run(
             "alpine:latest",
             command=f"sh -c 'cat {shlex.quote(path)}'",
