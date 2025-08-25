@@ -212,14 +212,14 @@ async def monitor_info_log(job_id: str, container):
                                             jobs[job_id]["recent_logs"].pop(0)
 
                                         # Parse specific logging patterns for progress updates
-                                        if "PIPELINE SESSION COMPLETED" in line:
+                                        if "🏁 THE ENTIRE PROGRAM IS COMPLETED" in line:
                                             jobs[job_id]["progress"] = "Analysis completed successfully"
                                             jobs[job_id]["status"] = "completed"
                                         elif "STAGE: ARTICLE SCRAPING" in line:
                                             jobs[job_id]["progress"] = "Scraping articles..."
                                         elif "STAGE: ARTICLE FILTERING" in line:
                                             jobs[job_id]["progress"] = "Filtering articles..."
-                                        elif "STAGE: LLM ANALYSIS & SCREENING" in line:
+                                        elif "STAGE: ARTICLE SCREENING" in line:
                                             jobs[job_id]["progress"] = "Running LLM analysis..."
                                         elif "Pipeline initialized for" in line:
                                             jobs[job_id]["progress"] = "Pipeline initialized"
@@ -257,7 +257,7 @@ async def monitor_info_log(job_id: str, container):
                                 for line in final_content.split('\n'):
                                     if line.strip():
                                         jobs[job_id]["recent_logs"].append(line.strip())
-                                        if "PIPELINE SESSION COMPLETED" in line:
+                                        if "THE ENTIRE PROGRAM IS COMPLETED" in line:
                                             jobs[job_id]["status"] = "completed"
                                             jobs[job_id]["progress"] = "Analysis completed successfully"
                         except:
