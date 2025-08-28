@@ -35,6 +35,8 @@ from fastapi.responses import StreamingResponse, FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 import aiofiles
 import uvicorn
+from fastapi import Response
+import shlex, time, io, zipfile
 
 # Tunables
 POLL_INTERVAL_SEC = 0.75
@@ -1171,120 +1173,67 @@ async def download_screening_report(job_id: str):
 
 @app.get("/jobs/{job_id}/download/all-results")
 async def download_all_results(job_id: str):
-    """Download all analysis results as a comprehensive zip file (in-memory)"""
+    """Download ALL analysis results (entire ticker folder) as a tar stream."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job = jobs[job_id]
-    ticker = job.get('ticker', '').upper()
+    ticker = jobs[job_id].get("ticker", "").upper()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="Ticker not found for job")
 
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker not available")
 
-    try:
-        buf = BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Add info.log
-            try:
-                log_content = docker_client.containers.run(
-                    "alpine:latest",
-                    command=f"sh -c 'cat /data/{ticker}/info.log'",
-                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                    remove=True,
-                    detach=False
-                )
-                if log_content:
-                    zipf.writestr("info.log", log_content)
-            except Exception:
-                pass
+    # If you captured extra sub-mounts during the job, we can mount them too:
+    extra_mounts = jobs[job_id].get("extra_mounts", [])  # list of {"Source": "...", "Destination": "...", "Mode": "ro"}
 
-            # Add screening report
-            try:
-                report_content = docker_client.containers.run(
-                    "alpine:latest",
-                    command=f"sh -c 'cat /data/{ticker}/screening_report.md'",
-                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                    remove=True,
-                    detach=False
-                )
-                if report_content:
-                    zipf.writestr("screening_report.md", report_content)
-            except Exception:
-                pass
+    def tar_stream():
+        helper = None
+        try:
+            # Build a volumes map: always mount the main data volume at /data (ro)
+            volumes = {DATA_VOLUME: {"bind": "/data", "mode": "ro"}}
+            # Also mount any sub-mounts (optional; keeps things future-proof if you ever split volumes)
+            for m in extra_mounts:
+                src = m.get("Source")
+                dst = m.get("Destination")
+                if src and dst:
+                    volumes[src] = {"bind": dst, "mode": m.get("Mode", "ro") or "ro"}
 
-            # Add structured data JSON
-            try:
-                json_content = docker_client.containers.run(
-                    "alpine:latest",
-                    command=f"sh -c 'cat /data/{ticker}/screening_data.json'",
-                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                    remove=True,
-                    detach=False
-                )
-                if json_content:
-                    zipf.writestr("screening_data.json", json_content)
-            except Exception:
-                pass
+            helper = docker_client.containers.create(
+                image="alpine:latest",
+                command="sleep 300",  # long enough; we’ll remove explicitly
+                volumes=volumes,
+                detach=True,
+                remove=False,
+            )
+            helper.start()
 
-            # Add searched articles
-            try:
-                searched_result = docker_client.containers.run(
-                    "alpine:latest",
-                    command=f"sh -c 'if [ -d /data/{ticker}/searched ]; then find /data/{ticker}/searched -name \"*.md\" -type f; fi'",
-                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                    remove=True,
-                    detach=False
-                )
-                searched_list = [p.strip() for p in searched_result.decode('utf-8').splitlines() if p.strip().endswith('.md')]
-                for path in searched_list:
-                    try:
-                        content = docker_client.containers.run(
-                            "alpine:latest",
-                            command=f"sh -c 'cat {shlex.quote(path)}'",
-                            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                            remove=True,
-                            detach=False
-                        )
-                        zipf.writestr(f"searched/{os.path.basename(path)}", content)
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+            # Sanity check that /data/TICKER exists
+            chk = helper.exec_run(f"sh -c 'test -d /data/{shlex.quote(ticker)}'")
+            if chk.exit_code != 0:
+                raise HTTPException(status_code=404, detail=f"No data found for {ticker}")
 
-            # Add filtered articles (md + optional csv index)
-            try:
-                filtered_result = docker_client.containers.run(
-                    "alpine:latest",
-                    command=f"sh -c 'if [ -d /data/{ticker}/filtered ]; then find /data/{ticker}/filtered -name \"*.md\" -o -name \"*.csv\" -type f; fi'",
-                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                    remove=True,
-                    detach=False
-                )
-                filtered_list = [p.strip() for p in filtered_result.decode('utf-8').splitlines() if p.strip()]
-                for path in filtered_list:
-                    try:
-                        content = docker_client.containers.run(
-                            "alpine:latest",
-                            command=f"sh -c 'cat {shlex.quote(path)}'",
-                            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                            remove=True,
-                            detach=False
-                        )
-                        subname = os.path.basename(path)
-                        zipf.writestr(f"filtered/{subname}", content)
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+            # Stream tar; IMPORTANT: do NOT kill the container until the generator finishes.
+            exec_res = helper.exec_run(
+                cmd=["tar", "-C", "/data", "-cf", "-", "--", ticker],
+                stream=True,
+                demux=False,
+            )
 
-        buf.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_complete_analysis.zip"'}
-        return StreamingResponse(buf, media_type='application/zip', headers=headers)
+            for chunk in exec_res.output:
+                if chunk:
+                    yield chunk
 
-    except Exception as e:
-        logger.error(f"Error creating complete analysis zip for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not create comprehensive zip file: {str(e)}")
+        finally:
+            # now it's safe to remove the helper
+            if helper is not None:
+                try:
+                    helper.remove(force=True)
+                except Exception:
+                    pass
 
+    headers = {"Content-Disposition": f'attachment; filename="{ticker}_complete_analysis.tar"'}
+    return StreamingResponse(tar_stream(), media_type="application/x-tar", headers=headers)
 
 @app.get("/jobs/{job_id}/download/financials-annual")
 async def download_financials_annual(job_id: str):
@@ -1323,41 +1272,96 @@ async def download_financials_annual(job_id: str):
         raise HTTPException(status_code=500, detail=f"Could not read financials annual file: {str(e)}")
 
 
+STABILITY_CHECK_INTERVAL = 0.5  # seconds
+STABILITY_CHECKS = 3            # consecutive identical sizes before streaming
+
 @app.get("/jobs/{job_id}/download/financial-model")
 async def download_financial_model(job_id: str):
-    """Download the financial_model_comprehensive_latest.xlsx file"""
-    # Try to get job info, but fall back to extracting ticker from job_id if not found
+    """Download the financial_model_comprehensive_latest.xlsx as raw bytes (no tar)."""
+    # Resolve ticker
     if job_id in jobs:
-        job = jobs[job_id]
-        ticker = job.get('ticker', '').upper()
+        ticker = (jobs[job_id].get("ticker") or "").upper()
     else:
-        # Extract ticker from job_id (format is usually TICKER_YYYYMMDD_HHMMSS)
-        ticker_part = job_id.split('_')[0] if '_' in job_id else job_id
-        ticker = ticker_part.upper()
-        logger.warning(f"Job {job_id} not found in memory, trying with ticker: {ticker}")
-    
+        ticker = (job_id.split("_")[0] if "_" in job_id else job_id).upper()
+
+    if not ticker:
+        raise HTTPException(status_code=400, detail="Ticker not found for job")
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker not available")
-    
-    try:
-        # Read the financial model Excel file
-        result = docker_client.containers.run(
-            "alpine:latest",
-            command=f"sh -c 'cat /data/{ticker}/models/financial_model_comprehensive_latest.xlsx'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-            remove=True,
-            detach=False
-        )
-        if not result:
-            raise HTTPException(status_code=404, detail="Financial model Excel not found")
 
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_financial_model_comprehensive_latest.xlsx"'}
-        return StreamingResponse(BytesIO(result), media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers=headers)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error downloading financial model for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not read financial model file: {str(e)}")
+    rel_path = f"/data/{ticker}/models/financial_model_comprehensive_latest.xlsx"
+    download_name = f"{ticker}_financial_model_comprehensive_latest.xlsx"
+
+    def stream_file():
+        helper = None
+        try:
+            # Keep helper alive for the duration of the stream
+            helper = docker_client.containers.create(
+                image="alpine:latest",
+                command="sleep 300",
+                volumes={DATA_VOLUME: {"bind": "/data", "mode": "ro"}},
+                detach=True,
+                remove=False,
+            )
+            helper.start()
+
+            # Ensure the file exists
+            chk = helper.exec_run(f"sh -c 'test -f {shlex.quote(rel_path)}'")
+            if chk.exit_code != 0:
+                raise HTTPException(status_code=404, detail="Financial model Excel not found")
+
+            # Wait for the file to be stable (size not increasing)
+            same = 0
+            last = -1
+            for _ in range(60):  # up to ~30s max wait
+                sz = helper.exec_run(
+                    f"sh -c 'stat -c %s {shlex.quote(rel_path)} || wc -c < {shlex.quote(rel_path)}'"
+                )
+                if sz.exit_code != 0:
+                    break
+                try:
+                    size = int((sz.output or b"0").decode().strip() or "0")
+                except Exception:
+                    size = 0
+                if size == last and size > 0:
+                    same += 1
+                    if same >= STABILITY_CHECKS:
+                        break
+                else:
+                    same = 0
+                    last = size
+                time.sleep(STABILITY_CHECK_INTERVAL)
+
+            # Stream raw bytes; use dd to avoid buffering surprises
+            exec_res = helper.exec_run(
+                cmd=["sh", "-lc", f"dd if={shlex.quote(rel_path)} bs=1M status=none"],
+                stream=True,
+                demux=False,
+            )
+            for chunk in exec_res.output:
+                if chunk:
+                    yield chunk
+
+        finally:
+            if helper is not None:
+                try:
+                    helper.remove(force=True)
+                except Exception:
+                    pass
+
+    # Optional: quick server-side sanity check before sending (non-blocking small read)
+    # Read just enough to be confident it's an XLSX (PK header). We won’t consume the generator here.
+    # If you want a stronger check, keep your old endpoint as `/debug/download/financial-model` only.
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{download_name}"',
+        # Some proxies try to “optimize” binary streams; tell them not to.
+        "Cache-Control": "no-transform",
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        # Avoid accidental proxy gzip for already-compressed content:
+        "Content-Encoding": "identity",
+    }
+    return StreamingResponse(stream_file(), media_type=headers["Content-Type"], headers=headers)
 
 
 @app.get("/jobs/{job_id}/download/filtered-report")
