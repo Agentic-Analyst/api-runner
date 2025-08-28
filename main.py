@@ -26,7 +26,7 @@ import shlex
 import subprocess
 import uuid
 import markdown
-
+import codecs
 
 import docker
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -35,6 +35,12 @@ from fastapi.responses import StreamingResponse, FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 import aiofiles
 import uvicorn
+
+# Tunables
+POLL_INTERVAL_SEC = 0.75
+IDLE_HEARTBEAT_SEC = 12
+FINAL_DRAIN_STABLE_CYCLES = 3  # how many consecutive polls with no growth before we finalize
+
 
 # Load environment variables from .env file
 try:
@@ -257,7 +263,7 @@ async def monitor_info_log(job_id: str, container):
                                 for line in final_content.split('\n'):
                                     if line.strip():
                                         jobs[job_id]["recent_logs"].append(line.strip())
-                                        if "THE ENTIRE PROGRAM IS COMPLETED" in line:
+                                        if "🏁 THE ENTIRE PROGRAM IS COMPLETED" in line:
                                             jobs[job_id]["status"] = "completed"
                                             jobs[job_id]["progress"] = "Analysis completed successfully"
                         except:
@@ -601,7 +607,7 @@ async def get_job_logs(job_id: str):
 
 @app.get("/jobs/{job_id}/logs/stream")
 async def get_job_logs_stream(job_id: str):
-    """Stream info.log file content directly in real-time using Server-Sent Events"""
+    """Stream info.log in real time using Server-Sent Events (robust tail with final drain)."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -613,121 +619,237 @@ async def get_job_logs_stream(job_id: str):
         raise HTTPException(status_code=503, detail="Docker not available")
 
     async def log_generator():
-        last_size = 0
+        last_size = 0               # byte offset already sent
         container = None
+        decoder = codecs.getincrementaldecoder('utf-8')()
+        pending_line = ""           # partial line carried between chunks
+        idle_timer = 0.0
+        stable_cycles = 0
+        have_seen_any_data = False
 
-        # Send initial connection confirmation
-        yield f"data: {json.dumps({'message': f'Connected to log stream for {ticker}', 'timestamp': datetime.now().isoformat(), 'type': 'connection'})}\n\n"
+        def sse(event_type: str, message: str):
+            payload = json.dumps({
+                "status": event_type,
+                "message": message,
+                "timestamp": datetime.now().isoformat()
+            })
+            # Debug: print every SSE payload to server terminal for visibility
+            try:
+                logger.info(f"SSE -> {event_type}: {payload}")
+            except Exception:
+                # Ensure logging never breaks SSE
+                pass
+            return f"event: {event_type}\ndata: {payload}\n\n"
 
-        # Try to get the analysis container
+        # initial connection notice
+        conn_msg = sse("connection", f"Connected to log stream for {ticker}")
+        logger.info(f"Emitting initial SSE connection for {ticker}")
+        yield conn_msg
+
+        # try to get the analysis container
         if container_id:
             try:
                 container = docker_client.containers.get(container_id)
                 logger.info(f"Found analysis container for {ticker}: {container_id}")
             except docker.errors.NotFound:
-                logger.info(f"Analysis container not found for {ticker}, will check volume")
+                logger.info(f"Analysis container not found for {ticker}, will use volume fallback")
+                container = None
 
-        while True:
+        async def probe_size_and_read_from_container(start_byte: int):
+            """Return (next_size:int, new_bytes:bytes) by reading from the running analysis container, or (0,b"") on miss."""
+            if not container:
+                return 0, b""
             try:
-                current_size = 0
-                new_content = ""
+                container.reload()
+                # path inside analysis container
+                path = f"/data/{ticker}/info.log"
+                # get file size in bytes
+                size_res = container.exec_run(
+                    f"sh -c 'if [ -f {path} ]; then wc -c {path} | awk {{\\''print $1\\''}}; else echo 0; fi'"
+                )
+                if size_res.exit_code != 0:
+                    return 0, b""
+                current_size = int((size_res.output or b"0").decode("utf-8").strip() or "0")
+                if current_size > start_byte:
+                    # read from byte N+1
+                    content_res = container.exec_run(
+                        f"sh -c 'if [ -f {path} ]; then tail -c +{start_byte + 1} {path}; fi'"
+                    )
+                    if content_res.exit_code == 0 and content_res.output:
+                        return current_size, content_res.output
+                return current_size, b""
+            except Exception as e:
+                logger.warning(f"Error reading from container {container_id}: {e}")
+                return 0, b""
 
-                # First, try to read from the running analysis container
+        async def probe_size_and_read_from_volume(start_byte: int):
+            """Return (next_size:int, new_bytes:bytes) via a short-lived alpine with the volume bound RO."""
+            try:
+                path = f"/data/{ticker}/info.log"
+                # size
+                size_out = docker_client.containers.run(
+                    "alpine:latest",
+                    command=f"sh -c 'if [ -f {path} ]; then wc -c {path} | awk {{\\''print $1\\''}}; else echo 0; fi'",
+                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                    remove=True,
+                    detach=False,
+                )
+                current_size = int((size_out or b"0").decode("utf-8").strip() or "0")
+                if current_size > start_byte:
+                    content_out = docker_client.containers.run(
+                        "alpine:latest",
+                        command=f"sh -c 'if [ -f {path} ]; then tail -c +{start_byte + 1} {path}; fi'",
+                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                        remove=True,
+                        detach=False,
+                    )
+                    return current_size, content_out or b""
+                return current_size, b""
+            except Exception as e:
+                logger.debug(f"Volume read failed (maybe file not ready yet): {e}")
+                return 0, b""
+
+        def emit_lines(decoded_text: str, flush: bool=True):
+            """Emit complete lines and keep the last partial in pending_line (outer scope)."""
+            nonlocal pending_line, have_seen_any_data
+            text = pending_line + decoded_text
+            # splitlines(True) keeps endlines; we use it to detect if last is complete
+            parts = text.splitlines(True)
+            if parts and (flush or parts[-1].endswith(("\n", "\r"))):
+                complete, pending = parts, ""
+            else:
+                complete, pending = parts[:-1], parts[-1] if parts else ""
+            for seg in complete:
+                line = seg.rstrip("\r\n")
+                if not line:
+                    continue
+                have_seen_any_data = True
+                if "ENTIRE PROGRAM" in line:
+                    # Let the final drain still run to ensure nothing is missed,
+                    # but also notify frontend that we're at logical completion.
+                    job["status"] = "completed"
+                    job["progress"] = "Analysis completed successfully"
+
+                    yield sse("completed", "🏁 THE ENTIRE PROGRAM IS COMPLETED")
+                    # yield sse("log", line)
+                else:
+                    yield sse("log", line)
+            pending_line = pending
+
+        async def drain_once():
+            """Read from container if running; otherwise from volume."""
+            nonlocal container, last_size
+            # prefer container while running
+            next_size, chunk = 0, b""
+            if container:
+                # read
+                next_size, chunk = await probe_size_and_read_from_container(last_size)
+                # if container stopped, try a final read and then null it out
+                try:
+                    container.reload()
+                    if container.status != "running":
+                        # attempt one more read after stop
+                        if next_size == last_size:
+                            # no size growth reported yet; still try tail from last_size+1
+                            _, extra_chunk = await probe_size_and_read_from_container(last_size)
+                            if extra_chunk:
+                                chunk += extra_chunk
+                                next_size = last_size + len(extra_chunk)
+                        container = None
+                except Exception:
+                    container = None
+
+            # fallback to volume if nothing came from container
+            if next_size <= last_size:
+                v_size, v_chunk = await probe_size_and_read_from_volume(last_size)
+                if v_size > last_size:
+                    next_size, chunk = v_size, v_chunk
+
+            # process bytes
+            if chunk:
+                decoded = decoder.decode(chunk)
+                # Emit decoded text lines and log them inside emit_lines
+                for evt in emit_lines(decoded):
+                    yield evt
+                last_size = next_size
+
+        try:
+            # main loop: poll until we drain and stabilize after completion/stop
+            while True:
+                something_new = False
+                async for evt in drain_once():
+                    something_new = True
+                    idle_timer = 0.0
+                    # If evt is a raw non-SSE string (e.g. comment/keep-alive), log it.
+                    try:
+                        evt_str = str(evt)
+                    except Exception:
+                        evt_str = None
+                    if evt_str and not evt_str.startswith("event:"):
+                        logger.info(f"SSE -> raw: {evt_str.strip()}")
+                    yield evt
+
+                if not something_new:
+                    idle_timer += POLL_INTERVAL_SEC
+
+                    # status heartbeat to keep proxies from buffering
+                    if idle_timer >= IDLE_HEARTBEAT_SEC:
+                        idle_timer = 0.0
+                        # SSE comment heartbeat line
+                        heartbeat = ": keep-alive\n\n"
+                        logger.info(f"SSE -> heartbeat: {heartbeat.strip()}")
+                        yield heartbeat
+                        # also send a friendly status if we haven't seen data yet
+                        if not have_seen_any_data:
+                            yield sse("status", "Analysis running, waiting for log output..." if container else "Waiting for analysis to start...")
+
+                # decide if we should enter finalization
+                job_done = job.get("status") in {"completed", "failed", "stopped"}
+                container_running = False
                 if container:
                     try:
                         container.reload()
-                        if container.status == 'running':
-                            # NOTE: inside the analysis container the volume is at /data
-                            size_result = container.exec_run(
-                                f"sh -c 'if [ -f /data/{ticker}/info.log ]; then wc -c /data/{ticker}/info.log | cut -d\" \" -f1; else echo 0; fi'"
-                            )
-                            if size_result.exit_code == 0:
-                                current_size = int(size_result.output.decode('utf-8').strip() or "0")
-
-                                if current_size > last_size:
-                                    content_result = container.exec_run(
-                                        f"sh -c 'if [ -f /data/{ticker}/info.log ]; then tail -c +{last_size + 1} /data/{ticker}/info.log; fi'"
-                                    )
-                                    if content_result.exit_code == 0:
-                                        new_content = content_result.output.decode('utf-8').strip()
-                        else:
-                            # Container finished, try one final read then switch to volume
-                            try:
-                                content_result = container.exec_run(
-                                    f"sh -c 'if [ -f /data/{ticker}/info.log ]; then tail -c +{last_size + 1} /data/{ticker}/info.log; fi'"
-                                )
-                                if content_result.exit_code == 0:
-                                    new_content = content_result.output.decode('utf-8').strip()
-                                    if new_content:
-                                        current_size = last_size + len(new_content)
-                            except:
-                                pass
-                            container = None  # Stop trying to read from container
-                    except Exception as container_error:
-                        logger.warning(f"Error reading from container {container_id}: {container_error}")
+                        container_running = (container.status == "running")
+                    except Exception:
+                        container_running = False
                         container = None
 
-                # If no container or container method failed, try volume (fallback)
-                if current_size == 0 and last_size == 0:
-                    try:
-                        size_container = docker_client.containers.run(
-                            "alpine:latest",
-                            command=f"sh -c 'if [ -f /data/{ticker}/info.log ]; then wc -c /data/{ticker}/info.log | cut -d\" \" -f1; else echo 0; fi'",
-                            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                            remove=True,
-                            detach=False
-                        )
-                        volume_size = int(size_container.decode('utf-8').strip() or "0")
+                if job_done and not container_running:
+                    # final drain logic: keep polling until the file is stable for N cycles
+                    if something_new:
+                        stable_cycles = 0
+                    else:
+                        stable_cycles += 1
+                    if stable_cycles >= FINAL_DRAIN_STABLE_CYCLES:
+                        # flush any pending partial line
+                        for evt in emit_lines("", flush=True):
+                            yield evt
+                        # emit final completed if not already sent
+                        yield sse("completed", "Analysis completed")
+                        # short grace to ensure the client receives the last events
+                        await asyncio.sleep(0.25)
+                        break
 
-                        if volume_size > last_size:
-                            content_container = docker_client.containers.run(
-                                "alpine:latest",
-                                command=f"sh -c 'if [ -f /data/{ticker}/info.log ]; then tail -c +{last_size + 1} /data/{ticker}/info.log; fi'",
-                                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-                                remove=True,
-                                detach=False
-                            )
-                            new_content = content_container.decode('utf-8').strip()
-                            current_size = volume_size
-                    except Exception as volume_error:
-                        logger.debug(f"Volume read failed (expected if file doesn't exist yet): {volume_error}")
+                await asyncio.sleep(POLL_INTERVAL_SEC)
 
-                # Process new content if any
-                if new_content:
-                    logger.info(f"New content found for {ticker}: {len(new_content)} characters")
-                    # Send each new line immediately as it appears in info.log
-                    for line in new_content.split('\n'):
-                        if line.strip():
-                            yield f"data: {json.dumps({'message': line.strip(), 'timestamp': datetime.now().isoformat(), 'type': 'log'})}\n\n"
-                    last_size = current_size
-                else:
-                    # Send heartbeat/status if no new content
-                    if last_size == 0:
-                        if container:
-                            yield f"data: {json.dumps({'message': 'Analysis running, waiting for log output...', 'timestamp': datetime.now().isoformat(), 'type': 'status'})}\n\n"
-                        else:
-                            # Check if job is completed
-                            if job.get('status') == 'completed':
-                                yield f"data: {json.dumps({'message': 'Analysis completed', 'timestamp': datetime.now().isoformat(), 'type': 'completion'})}\n\n"
-                                break
-                            else:
-                                yield f"data: {json.dumps({'message': 'Waiting for analysis to start...', 'timestamp': datetime.now().isoformat(), 'type': 'status'})}\n\n"
+        except Exception as e:
+            logger.error(f"Error streaming info.log for job {job_id}: {e}")
+            yield sse("error", f"Stream error: {str(e)}")
 
-            except Exception as e:
-                logger.error(f"Error streaming info.log for job {job_id}: {e}")
-                yield f"data: {json.dumps({'error': f'Stream error: {str(e)}', 'timestamp': datetime.now().isoformat(), 'type': 'error'})}\n\n"
-                break
-
-            # Wait before next check
-            await asyncio.sleep(1)
-
-    return StreamingResponse(log_generator(), media_type="text/event-stream", headers={
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET",
-        "Access-Control-Allow-Headers": "Cache-Control"
-    })
+    return StreamingResponse(
+        log_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # Critical for Nginx or similar reverse proxies:
+            "X-Accel-Buffering": "no",
+            # CORS, if needed:
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET",
+            "Access-Control-Allow-Headers": "Cache-Control",
+        },
+    )
 
 
 @app.get("/jobs/{job_id}/files/{filename}")
@@ -1528,4 +1650,4 @@ async def get_detailed_job_status(job_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8080, workers=1)
