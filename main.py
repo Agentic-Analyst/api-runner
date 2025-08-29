@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 import aiofiles
 import uvicorn
 from fastapi import Response
-import shlex, time, io, zipfile
+import shlex, time, io, zipfile, hashlib
 
 # Tunables
 POLL_INTERVAL_SEC = 0.75
@@ -1272,96 +1272,99 @@ async def download_financials_annual(job_id: str):
         raise HTTPException(status_code=500, detail=f"Could not read financials annual file: {str(e)}")
 
 
-STABILITY_CHECK_INTERVAL = 0.5  # seconds
-STABILITY_CHECKS = 3            # consecutive identical sizes before streaming
+STABILITY_CHECK_INTERVAL = 0.5
+STABILITY_CHECKS = 3
+COPY_TIMEOUT_SEC = 60
 
 @app.get("/jobs/{job_id}/download/financial-model")
-async def download_financial_model(job_id: str):
-    """Download the financial_model_comprehensive_latest.xlsx as raw bytes (no tar)."""
-    # Resolve ticker
-    if job_id in jobs:
-        ticker = (jobs[job_id].get("ticker") or "").upper()
-    else:
-        ticker = (job_id.split("_")[0] if "_" in job_id else job_id).upper()
-
+async def download_financial_model(job_id: str, background_tasks: BackgroundTasks):
+    # resolve ticker
+    ticker = (jobs.get(job_id, {}) or {}).get("ticker")
     if not ticker:
-        raise HTTPException(status_code=400, detail="Ticker not found for job")
+        ticker = (job_id.split("_")[0] if "_" in job_id else job_id).upper()
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker not available")
 
-    rel_path = f"/data/{ticker}/models/financial_model_comprehensive_latest.xlsx"
+    src_path = f"/data/{ticker}/models/financial_model_comprehensive_latest.xlsx"
     download_name = f"{ticker}_financial_model_comprehensive_latest.xlsx"
 
-    def stream_file():
-        helper = None
-        try:
-            # Keep helper alive for the duration of the stream
-            helper = docker_client.containers.create(
-                image="alpine:latest",
-                command="sleep 300",
-                volumes={DATA_VOLUME: {"bind": "/data", "mode": "ro"}},
-                detach=True,
-                remove=False,
+    helper = None
+    tmp_path = None
+    try:
+        # helper container, RO mount
+        helper = docker_client.containers.create(
+            image="alpine:latest",
+            command="sleep 300",
+            volumes={DATA_VOLUME: {"bind": "/data", "mode": "ro"}},
+            detach=True, remove=False
+        )
+        helper.start()
+
+        # ensure file exists
+        if helper.exec_run(f"sh -c 'test -f {shlex.quote(src_path)}'").exit_code != 0:
+            raise HTTPException(status_code=404, detail="Financial model Excel not found")
+
+        # wait for stable size
+        same, last = 0, -1
+        start = time.time()
+        while time.time() - start < COPY_TIMEOUT_SEC:
+            sz = helper.exec_run(
+                f"sh -c 'stat -c %s {shlex.quote(src_path)} || wc -c < {shlex.quote(src_path)}'"
             )
-            helper.start()
-
-            # Ensure the file exists
-            chk = helper.exec_run(f"sh -c 'test -f {shlex.quote(rel_path)}'")
-            if chk.exit_code != 0:
-                raise HTTPException(status_code=404, detail="Financial model Excel not found")
-
-            # Wait for the file to be stable (size not increasing)
-            same = 0
-            last = -1
-            for _ in range(60):  # up to ~30s max wait
-                sz = helper.exec_run(
-                    f"sh -c 'stat -c %s {shlex.quote(rel_path)} || wc -c < {shlex.quote(rel_path)}'"
-                )
-                if sz.exit_code != 0:
+            size = int((sz.output or b"0").decode().strip() or "0")
+            if size == last and size > 0:
+                same += 1
+                if same >= STABILITY_CHECKS:
                     break
-                try:
-                    size = int((sz.output or b"0").decode().strip() or "0")
-                except Exception:
-                    size = 0
-                if size == last and size > 0:
-                    same += 1
-                    if same >= STABILITY_CHECKS:
-                        break
-                else:
-                    same = 0
-                    last = size
-                time.sleep(STABILITY_CHECK_INTERVAL)
+            else:
+                same, last = 0, size
+            time.sleep(STABILITY_CHECK_INTERVAL)
 
-            # Stream raw bytes; use dd to avoid buffering surprises
+        # copy bytes to a host temp file
+        fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        with open(tmp_path, "wb") as dst:
             exec_res = helper.exec_run(
-                cmd=["sh", "-lc", f"dd if={shlex.quote(rel_path)} bs=1M status=none"],
-                stream=True,
-                demux=False,
+                cmd=["sh", "-lc", f"dd if={shlex.quote(src_path)} bs=1M status=none"],
+                stream=True, demux=False
             )
             for chunk in exec_res.output:
                 if chunk:
-                    yield chunk
+                    dst.write(chunk)
 
-        finally:
-            if helper is not None:
-                try:
-                    helper.remove(force=True)
-                except Exception:
-                    pass
+        # sanity check: valid XLSX zip
+        if not zipfile.is_zipfile(tmp_path):
+            os.remove(tmp_path)
+            raise HTTPException(status_code=500, detail="Downloaded Excel appears invalid/corrupted")
 
-    # Optional: quick server-side sanity check before sending (non-blocking small read)
-    # Read just enough to be confident it's an XLSX (PK header). We won’t consume the generator here.
-    # If you want a stronger check, keep your old endpoint as `/debug/download/financial-model` only.
+        # checksum for logs/clients
+        sha256 = hashlib.sha256()
+        with open(tmp_path, "rb") as f:
+            for b in iter(lambda: f.read(1 << 20), b""):
+                sha256.update(b)
+        digest = sha256.hexdigest()
 
-    headers = {
-        "Content-Disposition": f'attachment; filename="{download_name}"',
-        # Some proxies try to “optimize” binary streams; tell them not to.
-        "Cache-Control": "no-transform",
-        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        # Avoid accidental proxy gzip for already-compressed content:
-        "Content-Encoding": "identity",
-    }
-    return StreamingResponse(stream_file(), media_type=headers["Content-Type"], headers=headers)
+        # schedule cleanup after response finishes
+        background_tasks.add_task(lambda p=tmp_path: os.path.exists(p) and os.remove(p))
+
+        headers = {
+            "Content-Disposition": f"attachment; filename={download_name}; filename*=UTF-8''{download_name}",
+            "Cache-Control": "no-transform",  # tell proxies not to fiddle with it
+            "X-File-SHA256": digest,          # easy integrity check client-side
+        }
+        return FileResponse(
+            path=tmp_path,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=download_name,
+            headers=headers,
+            background=background_tasks,
+        )
+    finally:
+        if helper is not None:
+            try:
+                helper.remove(force=True)
+            except Exception:
+                pass
 
 
 @app.get("/jobs/{job_id}/download/filtered-report")
