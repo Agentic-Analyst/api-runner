@@ -43,6 +43,11 @@ except ImportError:
     # If python-dotenv is not installed, we'll just use os.getenv
     pass
 
+# main.py (near your other imports)
+from auth_oauth import router as oauth_router  # existing
+from auth_code_login import router as code_router  # <— ADD THIS
+
+
 # Tunables
 POLL_INTERVAL_SEC = 0.75
 IDLE_HEARTBEAT_SEC = 12
@@ -60,20 +65,29 @@ def _csv_env(name: str, default: str = "") -> List[str]:
 
 # === BEGIN PATCHED APP INIT (drop-in replacement) ===
 # Read env
+# --- Env ---
 FRONTEND_ORIGINS = _csv_env("FRONTEND_ORIGIN", "http://localhost:3000")
-ROOT_PATH = os.getenv("ROOT_PATH", "")  # e.g., "/api" when mounted behind a proxy
+ROOT_PATH = os.getenv("ROOT_PATH", "")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-session-secret-change-me")
 SESSION_HTTPS_ONLY = os.getenv("SESSION_HTTPS_ONLY", "false").lower() == "true"
+SESSION_STORE_COOKIE = os.getenv("SESSION_STORE_COOKIE", "app_session")
 
-SESSION_STORE_COOKIE = os.getenv("SESSION_STORE_COOKIE", "app_session")  # <— NEW
+# NEW: make samesite configurable
+SESSION_SAMESITE = os.getenv("SESSION_SAMESITE", "lax").lower()
+if SESSION_SAMESITE not in {"lax", "none", "strict"}:
+    SESSION_SAMESITE = "lax"
 
+# Browsers require Secure when SameSite=None
+if SESSION_SAMESITE == "none" and not SESSION_HTTPS_ONLY:
+    # you can log a warning or force it on:
+    SESSION_HTTPS_ONLY = True
 
 # Build app with explicit middleware order: Session -> CORS -> (others)
 middleware = [
     Middleware(
         SessionMiddleware,
         secret_key=SESSION_SECRET,
-        same_site="lax",
+        same_site=SESSION_SAMESITE,   # <— use env
         https_only=SESSION_HTTPS_ONLY,
         max_age=60 * 60 * 8,
         path="/",
@@ -81,13 +95,16 @@ middleware = [
     ),
     Middleware(
         CORSMiddleware,
-        # Never use "*" together with allow_credentials=True; pick a concrete origin.
-        allow_origins=FRONTEND_ORIGINS,
+        allow_origins=FRONTEND_ORIGINS,   # list[str] is correct
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # Optional: expose headers or set max_age if you want
+        # expose_headers=["X-File-SHA256"],
+        # max_age=86400,
     ),
 ]
+
 app = FastAPI(
     title="Stock Analyst API Runner",
     description="API service for running stock analysis jobs in Docker containers",
@@ -98,6 +115,7 @@ app = FastAPI(
 
 # Routers
 app.include_router(oauth_router)
+app.include_router(code_router)
 
 # Health endpoint (useful for container probes)
 @app.get("/healthz")
@@ -697,49 +715,56 @@ async def get_job_logs_stream(job_id: str):
                 return 0, b""
             try:
                 container.reload()
-                # path inside analysis container
                 path = f"/data/{ticker}/info.log"
-                # get file size in bytes
+
+                # size (number only)
                 size_res = container.exec_run(
-                    f"sh -c 'if [ -f {path} ]; then wc -c {path} | awk {{\\''print $1\\''}}; else echo 0; fi'"
+                    f"sh -lc 'if [ -f {shlex.quote(path)} ]; then wc -c < {shlex.quote(path)}; else echo 0; fi'"
                 )
                 if size_res.exit_code != 0:
+                    logger.debug(f"container size check failed: exit={size_res.exit_code} out={size_res.output!r}")
                     return 0, b""
-                current_size = int((size_res.output or b"0").decode("utf-8").strip() or "0")
+
+                current_size = int((size_res.output or b"0").decode().strip() or "0")
+
                 if current_size > start_byte:
-                    # read from byte N+1
+                    # read from byte N+1 (tail -c +N)
                     content_res = container.exec_run(
-                        f"sh -c 'if [ -f {path} ]; then tail -c +{start_byte + 1} {path}; fi'"
+                        f"sh -lc 'if [ -f {shlex.quote(path)} ]; then tail -c +{start_byte + 1} {shlex.quote(path)}; fi'"
                     )
                     if content_res.exit_code == 0 and content_res.output:
                         return current_size, content_res.output
+
                 return current_size, b""
             except Exception as e:
                 logger.warning(f"Error reading from container {container_id}: {e}")
                 return 0, b""
 
+
         async def probe_size_and_read_from_volume(start_byte: int):
-            """Return (next_size:int, new_bytes:bytes) via a short-lived alpine with the volume bound RO."""
+            """Return (next_size:int, new_bytes:bytes) via short-lived alpine with the volume bound RO."""
             try:
                 path = f"/data/{ticker}/info.log"
-                # size
+
                 size_out = docker_client.containers.run(
                     "alpine:latest",
-                    command=f"sh -c 'if [ -f {path} ]; then wc -c {path} | awk {{\\''print $1\\''}}; else echo 0; fi'",
+                    command=f"sh -lc 'if [ -f {shlex.quote(path)} ]; then wc -c < {shlex.quote(path)}; else echo 0; fi'",
                     volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
                     remove=True,
                     detach=False,
                 )
-                current_size = int((size_out or b"0").decode("utf-8").strip() or "0")
+                current_size = int((size_out or b"0").decode().strip() or "0")
+
                 if current_size > start_byte:
                     content_out = docker_client.containers.run(
                         "alpine:latest",
-                        command=f"sh -c 'if [ -f {path} ]; then tail -c +{start_byte + 1} {path}; fi'",
+                        command=f"sh -lc 'if [ -f {shlex.quote(path)} ]; then tail -c +{start_byte + 1} {shlex.quote(path)}; fi'",
                         volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
                         remove=True,
                         detach=False,
                     )
                     return current_size, content_out or b""
+
                 return current_size, b""
             except Exception as e:
                 logger.debug(f"Volume read failed (maybe file not ready yet): {e}")
@@ -879,8 +904,6 @@ async def get_job_logs_stream(job_id: str):
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
-            # Important for browsers when using credentials:
-            "Access-Control-Allow-Origin": FRONTEND_ORIGINS,
             "Vary": "Origin",
         },
     )
