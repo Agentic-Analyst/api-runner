@@ -4,6 +4,11 @@ A FastAPI service to manage and run stock analysis jobs using Docker containers.
 
 ## Setup
 
+docker build -t fuzanwenn/api-runner:latest .
+docker push fuzanwenn/api-runner:latest
+docker compose pull api-runner               
+docker compose up -d --force-recreate api-runner
+
 ### Prerequisites
 
 You'll need API keys for the stock analyst backend:

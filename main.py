@@ -23,9 +23,6 @@ import zipfile
 import shutil
 from io import BytesIO
 import shlex
-import subprocess
-import uuid
-import markdown
 import codecs
 
 import docker
@@ -33,18 +30,12 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
-import aiofiles
 import uvicorn
 from fastapi import Response
 import shlex, time, io, zipfile, hashlib
-
-# Tunables
-POLL_INTERVAL_SEC = 0.75
-IDLE_HEARTBEAT_SEC = 12
-FINAL_DRAIN_STABLE_CYCLES = 3  # how many consecutive polls with no growth before we finalize
-
-
-# Load environment variables from .env file
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware import Middleware
+from auth_oauth import router as oauth_router  # noqa: E402
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -52,25 +43,68 @@ except ImportError:
     # If python-dotenv is not installed, we'll just use os.getenv
     pass
 
+# Tunables
+POLL_INTERVAL_SEC = 0.75
+IDLE_HEARTBEAT_SEC = 12
+FINAL_DRAIN_STABLE_CYCLES = 3  # how many consecutive polls with no growth before we finalize
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
+# --- Env / App init ---
+def _csv_env(name: str, default: str = "") -> List[str]:
+    raw = os.getenv(name, default)
+    vals = [v.strip() for v in raw.split(",") if v.strip()]
+    return vals
+
+# === BEGIN PATCHED APP INIT (drop-in replacement) ===
+# Read env
+FRONTEND_ORIGINS = _csv_env("FRONTEND_ORIGIN", "http://localhost:3000")
+ROOT_PATH = os.getenv("ROOT_PATH", "")  # e.g., "/api" when mounted behind a proxy
+SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-session-secret-change-me")
+SESSION_HTTPS_ONLY = os.getenv("SESSION_HTTPS_ONLY", "false").lower() == "true"
+
+SESSION_STORE_COOKIE = os.getenv("SESSION_STORE_COOKIE", "app_session")  # <— NEW
+
+
+# Build app with explicit middleware order: Session -> CORS -> (others)
+middleware = [
+    Middleware(
+        SessionMiddleware,
+        secret_key=SESSION_SECRET,
+        same_site="lax",
+        https_only=SESSION_HTTPS_ONLY,
+        max_age=60 * 60 * 8,
+        path="/",
+        session_cookie=SESSION_STORE_COOKIE,
+    ),
+    Middleware(
+        CORSMiddleware,
+        # Never use "*" together with allow_credentials=True; pick a concrete origin.
+        allow_origins=FRONTEND_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    ),
+]
 app = FastAPI(
     title="Stock Analyst API Runner",
     description="API service for running stock analysis jobs in Docker containers",
-    version="1.0.0"
+    version="1.0.0",
+    root_path=ROOT_PATH,
+    middleware=middleware,
 )
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Routers
+app.include_router(oauth_router)
+
+# Health endpoint (useful for container probes)
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+# === END PATCHED APP INIT ===
+
 
 # Global variables
 docker_client = None
@@ -844,12 +878,10 @@ async def get_job_logs_stream(job_id: str):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            # Critical for Nginx or similar reverse proxies:
             "X-Accel-Buffering": "no",
-            # CORS, if needed:
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET",
-            "Access-Control-Allow-Headers": "Cache-Control",
+            # Important for browsers when using credentials:
+            "Access-Control-Allow-Origin": FRONTEND_ORIGINS,
+            "Vary": "Origin",
         },
     )
 

@@ -2,6 +2,9 @@ version: '3.8'
 
 services:
   api-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: fuzanwenn/api-runner:latest
     container_name: stock-analyst-api-runner
     ports:
@@ -10,11 +13,19 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - stockdata:/data
     environment:
+      - AUTHLIB_INSECURE_TRANSPORT=1   # ← allow http:// for OAuth in dev
+      - SESSION_SECRET=***REMOVED***
+      - AUTH_SECRET=***REMOVED***
+      - GOOGLE_CLIENT_ID=***REMOVED***           # ← your Google OAuth client id
+      - GOOGLE_CLIENT_SECRET=***REMOVED***
+      - GITHUB_CLIENT_ID=***REMOVED***           # ← your GitHub OAuth client id
+      - GITHUB_CLIENT_SECRET=***REMOVED***
       - BACKEND_IMAGE=fuzanwenn/stock-analyst:latest
       - DATA_VOLUME=stockdata
       - DOCKER_HOST=unix:///var/run/docker.sock
       - SERPAPI_API_KEY=${SERPAPI_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - FRONTEND_ORIGIN=http://localhost:3000,http://localhost:5173
     env_file:
       - .env
     restart: unless-stopped
