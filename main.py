@@ -38,6 +38,7 @@ from fastapi import Response
 import shlex, time, io, zipfile, hashlib
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware import Middleware
+from agent.nl_agent import NLAgent
 from auth_oauth import router as oauth_router  # noqa: E402
 from md_pdf_converter import convert_md_to_pdf
 try:
@@ -157,6 +158,26 @@ class JobRequest(BaseModel):
     scaling: Optional[float] = Field(default=None, description="Base scaling factor (default: 0.15)")
     adjustment_cap: Optional[float] = Field(default=None, description="Maximum adjustment % (default: 0.20)")
 
+class NLRequest(BaseModel):
+    """Natural language request model that includes the request text plus optional override parameters."""
+    request: str = Field(..., description="Natural language request describing the analysis task")
+    # Optional overrides - if provided, these take priority over NL-extracted values
+    ticker: Optional[str] = Field(default=None, description="Stock ticker symbol (e.g., NVDA)")
+    company: Optional[str] = Field(default=None, description="Company name (e.g., 'NVIDIA')")
+    email: str = Field(..., description="User email for data organization")
+    pipeline: Optional[str] = Field(default=None, description="Pipeline to run (default: comprehensive)")
+    model: Optional[str] = Field(default=None, description="Financial model type (default: comprehensive)")
+    years: Optional[int] = Field(default=None, description="Projection years (default: 5)")
+    term_growth: Optional[float] = Field(default=None, description="Terminal growth rate (auto-inferred)")
+    wacc: Optional[float] = Field(default=None, description="Override WACC (auto-inferred)")
+    strategy: Optional[str] = Field(default=None, description="Force specific forecast strategy")
+    max_articles: Optional[int] = Field(default=None, description="Maximum articles to scrape (default: 20)")
+    min_score: Optional[float] = Field(default=None, description="Minimum relevance score (default: 3.0)")
+    max_filtered: Optional[int] = Field(default=None, description="Maximum filtered articles (default: 10)")
+    min_confidence: Optional[float] = Field(default=None, description="Minimum confidence (default: 0.5)")
+    scaling: Optional[float] = Field(default=None, description="Base scaling factor (default: 0.15)")
+    adjustment_cap: Optional[float] = Field(default=None, description="Maximum adjustment % (default: 0.20)")
+
 class JobResponse(BaseModel):
     job_id: str
     status: str
@@ -174,6 +195,76 @@ class JobStatus(BaseModel):
     latest_log: Optional[str] = None
     last_activity: Optional[str] = None
     recent_logs: Optional[List[str]] = None
+
+def process_nl_request(nl_req: NLRequest) -> JobRequest:
+    """
+    Process natural language request through NLAgent and merge with provided parameters.
+    Provided parameters take priority over NL-extracted ones.
+    """
+    try:
+        # Use NLAgent to extract parameters from the request
+        nl_agent = NLAgent()
+        extracted_args = nl_agent.process_request(nl_req.request)
+        
+        logger.info(f"NL Agent extracted: {extracted_args}")
+        
+        # Create final parameters by merging extracted and provided values
+        # Provided values take priority over extracted ones
+        final_args = {}
+        
+        # Handle ticker - prefer provided, then extracted, then raise error
+        if nl_req.ticker:
+            final_args['ticker'] = nl_req.ticker
+        elif extracted_args.get('ticker'):
+            final_args['ticker'] = extracted_args['ticker']
+        else:
+            raise ValueError("No ticker found in request or provided parameters")
+            
+        # Handle company - prefer provided, then extracted (mapped from company_name), then raise error
+        if nl_req.company:
+            final_args['company'] = nl_req.company
+        elif extracted_args.get('company_name'):
+            final_args['company'] = extracted_args['company_name']
+        elif extracted_args.get('company'):
+            final_args['company'] = extracted_args['company']
+        else:
+            raise ValueError("No company found in request or provided parameters")
+            
+        # Email is always required from the request
+        final_args['email'] = nl_req.email
+        
+        # For other parameters, prefer provided, then extracted, then None (use defaults)
+        param_mapping = {
+            'pipeline': 'pipeline',
+            'model': 'model', 
+            'years': 'years',
+            'term_growth': 'term_growth',
+            'wacc': 'wacc',
+            'strategy': 'strategy',
+            'max_articles': 'max_articles',
+            'min_score': 'min_score',
+            'max_filtered': 'max_filtered',
+            'min_confidence': 'min_confidence',
+            'scaling': 'scaling',
+            'adjustment_cap': 'adjustment_cap'
+        }
+        
+        for param_name, extracted_key in param_mapping.items():
+            provided_value = getattr(nl_req, param_name, None)
+            if provided_value is not None:
+                final_args[param_name] = provided_value
+            elif extracted_args.get(extracted_key) is not None:
+                final_args[param_name] = extracted_args[extracted_key]
+            # else: leave as None to use defaults
+        
+        logger.info(f"Final merged parameters: {final_args}")
+        
+        # Create and return JobRequest with merged parameters
+        return JobRequest(**final_args)
+        
+    except Exception as e:
+        logger.error(f"Error processing NL request: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to process natural language request: {str(e)}")
 
 # ------------- Docker helpers -------------
 def init_docker_client():
@@ -536,6 +627,104 @@ async def start_analysis(job: JobRequest, background_tasks: BackgroundTasks):
     )
 
     return JobResponse(job_id=job_id, status="pending", message="Analysis job started")
+
+# ------------- Natural Language Request Processing -------------
+@app.post("/nl/request", response_model=JobResponse)
+async def process_nl_request_endpoint(nl_req: NLRequest, background_tasks: BackgroundTasks):
+    """
+    Process a natural language request for stock analysis.
+    
+    The request text is processed by NLAgent to extract parameters, which are then
+    merged with any explicitly provided parameters (provided parameters take priority).
+    """
+    if not docker_client:
+        raise HTTPException(status_code=503, detail="Docker service not available")
+
+    if not SERPAPI_API_KEY or not OPENAI_API_KEY:
+        raise HTTPException(status_code=400, detail="API keys not configured")
+    
+    if not nl_req.email:
+        raise HTTPException(status_code=400, detail="User email is required")
+
+    try:
+        # Process the natural language request and get merged parameters
+        job_request = process_nl_request(nl_req)
+        
+        # Log the processing result
+        logger.info(f"Processed NL request: '{nl_req.request}' -> ticker: {job_request.ticker}, company: {job_request.company}")
+        
+        # Use the existing start_analysis logic
+        current_timestamp = datetime.now().isoformat()
+        user_email = job_request.email.lower()
+
+        job_id = f"{job_request.ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        jobs[job_id] = {
+            "job_id": job_id,
+            "ticker": job_request.ticker,
+            "company": job_request.company,
+            "user_email": user_email,
+            "timestamp": current_timestamp,
+            "status": "pending",
+            "created_at": datetime.now().isoformat(),
+            "progress": "Job queued from natural language request",
+            "original_request": nl_req.request,  # Store the original NL request for reference
+        }
+
+        background_tasks.add_task(
+            run_analysis_job,
+            job_id, job_request.ticker, job_request.company,
+            user_email, current_timestamp,
+            job_request.pipeline, job_request.model, job_request.years, job_request.term_growth,
+            job_request.wacc, job_request.strategy, job_request.max_articles, job_request.min_score,
+            job_request.max_filtered, job_request.min_confidence, job_request.scaling, job_request.adjustment_cap,
+        )
+
+        return JobResponse(job_id=job_id, status="pending", message=f"Natural language analysis job started for {job_request.ticker}")
+        
+    except Exception as e:
+        logger.error(f"Error in NL request processing: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to process request: {str(e)}")
+
+# ------------- Test NL Processing (debug endpoint) -------------
+@app.post("/nl/test")
+async def test_nl_processing(nl_req: NLRequest):
+    """
+    Test endpoint to see what parameters the NL agent would extract from a request.
+    This is for debugging and doesn't start an actual job.
+    """
+    try:
+        # Process the natural language request
+        job_request = process_nl_request(nl_req)
+        
+        return {
+            "original_request": nl_req.request,
+            "extracted_parameters": {
+                "ticker": job_request.ticker,
+                "company": job_request.company,
+                "email": job_request.email,
+                "pipeline": job_request.pipeline,
+                "model": job_request.model,
+                "years": job_request.years,
+                "term_growth": job_request.term_growth,
+                "wacc": job_request.wacc,
+                "strategy": job_request.strategy,
+                "max_articles": job_request.max_articles,
+                "min_score": job_request.min_score,
+                "max_filtered": job_request.max_filtered,
+                "min_confidence": job_request.min_confidence,
+                "scaling": job_request.scaling,
+                "adjustment_cap": job_request.adjustment_cap,
+            },
+            "provided_overrides": {
+                k: v for k, v in nl_req.dict().items() 
+                if k != "request" and v is not None
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in NL test processing: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to process request: {str(e)}")
 
 # ------------- Read job(s) -------------
 @app.get("/jobs/{job_id}", response_model=JobStatus)
