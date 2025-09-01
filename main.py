@@ -39,6 +39,7 @@ import shlex, time, io, zipfile, hashlib
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware import Middleware
 from auth_oauth import router as oauth_router  # noqa: E402
+from md_pdf_converter import convert_md_to_pdf
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -796,7 +797,9 @@ async def download_file(job_id: str, filename: str):
 
     try:
         if filename.startswith("price_adjustment_explanation"):
-            path = f"{base}/models/{filename}"
+            path = f"{base}/reports/{filename}"
+        elif filename.startswith("screening"):
+            path = f"{base}/screened/{filename}"
         else:
             path = f"{base}/{filename}"
 
@@ -978,7 +981,7 @@ async def download_screening_report(job_id: str):
     try:
         result = docker_client.containers.run(
             "alpine:latest",
-            command=f"sh -c 'cat {shlex.quote(base)}/screening_report.md'",
+            command=f"sh -c 'cat {shlex.quote(base)}/screened/screening_report.md'",
             volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
             remove=True,
             detach=False
@@ -986,70 +989,7 @@ async def download_screening_report(job_id: str):
         if not result:
             raise HTTPException(status_code=404, detail="Screening report not found")
         md_content = result.decode('utf-8')
-
-        import markdown
-        html_content = markdown.markdown(md_content, output_format="html5")
-
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.pagesizes import letter
-        from reportlab.lib.units import inch
-        from io import BytesIO
-        import re
-
-        buffer = BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter,
-                                topMargin=1*inch, bottomMargin=1*inch,
-                                leftMargin=1*inch, rightMargin=1*inch)
-        styles = getSampleStyleSheet()
-        title_style = ParagraphStyle('CustomTitle', parent=styles['Title'],
-                                     fontSize=24, spaceAfter=30, textColor='darkblue')
-        heading_style = ParagraphStyle('CustomHeading', parent=styles['Heading1'],
-                                       fontSize=16, spaceAfter=12, textColor='darkblue')
-
-        story = []
-        story.append(Paragraph(f"{ticker} Stock Analysis Report", title_style))
-        story.append(Spacer(1, 20))
-
-        lines = html_content.split('\n')
-        current_paragraph = ""
-        for line in lines:
-            line = line.strip()
-            if not line:
-                if current_paragraph:
-                    clean_text = re.sub(r'<[^>]+>', '', current_paragraph)
-                    if clean_text.strip():
-                        story.append(Paragraph(clean_text, styles['Normal']))
-                        story.append(Spacer(1, 12))
-                    current_paragraph = ""
-                continue
-            if line.startswith('<h'):
-                if current_paragraph:
-                    clean_text = re.sub(r'<[^>]+>', '', current_paragraph)
-                    if clean_text.strip():
-                        story.append(Paragraph(clean_text, styles['Normal']))
-                        story.append(Spacer(1, 12))
-                    current_paragraph = ""
-                clean_heading = re.sub(r'<[^>]+>', '', line)
-                if clean_heading.strip():
-                    story.append(Paragraph(clean_heading, heading_style))
-                    story.append(Spacer(1, 6))
-            else:
-                current_paragraph += " " + line
-
-        if current_paragraph:
-            clean_text = re.sub(r'<[^>]+>', '', current_paragraph)
-            if clean_text.strip():
-                story.append(Paragraph(clean_text, styles['Normal']))
-
-        try:
-            doc.build(story)
-            pdf_bytes = buffer.getvalue()
-            buffer.close()
-        except Exception as e:
-            buffer.close()
-            raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
-
+        pdf_bytes = convert_md_to_pdf(md_content, ticker)
         headers = {"Content-Disposition": f'attachment; filename="{ticker}_screening_report.pdf"'}
         return StreamingResponse(BytesIO(pdf_bytes), media_type='application/pdf', headers=headers)
     except HTTPException:
@@ -1160,7 +1100,8 @@ STABILITY_CHECKS = 3
 COPY_TIMEOUT_SEC = 60
 
 @app.get("/jobs/{job_id}/download/financial-model")
-async def download_financial_model(job_id: str, background_tasks: BackgroundTasks):
+async def download_financial_model(job_id: str):
+    """Download the financial_model_comprehensive_latest.xlsx file"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     if not docker_client:
@@ -1168,81 +1109,28 @@ async def download_financial_model(job_id: str, background_tasks: BackgroundTask
 
     job = jobs[job_id]
     base = job_root(job)
-    ticker = (job.get("ticker") or "").upper()
-
-    src_path = f"{base}/models/financial_model_comprehensive_latest.xlsx"
-    download_name = f"{ticker}_financial_model_comprehensive_latest.xlsx"
-
-    helper = None
-    tmp_path = None
+    ticker = (job.get('ticker') or '').upper()
+    
     try:
-        helper = docker_client.containers.create(
-            image="alpine:latest",
-            command="sleep 300",
-            volumes={DATA_VOLUME: {"bind": "/data", "mode": "ro"}},
-            detach=True, remove=False
+        # Read the financial model Excel file
+        result = docker_client.containers.run(
+            "alpine:latest",
+            command=f"sh -c 'cat {shlex.quote(base)}/models/financial_model_comprehensive_latest.xlsx'",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            remove=True,
+            detach=False
         )
-        helper.start()
-
-        if helper.exec_run(f"sh -c 'test -f {shlex.quote(src_path)}'").exit_code != 0:
+        if not result:
             raise HTTPException(status_code=404, detail="Financial model Excel not found")
 
-        same, last = 0, -1
-        start = time.time()
-        while time.time() - start < COPY_TIMEOUT_SEC:
-            sz = helper.exec_run(
-                f"sh -c 'stat -c %s {shlex.quote(src_path)} || wc -c < {shlex.quote(src_path)}'"
-            )
-            size = int((sz.output or b"0").decode().strip() or "0")
-            if size == last and size > 0:
-                same += 1
-                if same >= STABILITY_CHECKS:
-                    break
-            else:
-                same, last = 0, size
-            time.sleep(STABILITY_CHECK_INTERVAL)
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_financial_model_comprehensive_latest.xlsx"'}
+        return StreamingResponse(BytesIO(result), media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers=headers)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading financial model for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read financial model file: {str(e)}")
 
-        fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
-        os.close(fd)
-        with open(tmp_path, "wb") as dst:
-            exec_res = helper.exec_run(
-                cmd=["sh", "-lc", f"dd if={shlex.quote(src_path)} bs=1M status=none"],
-                stream=True, demux=False
-            )
-            for chunk in exec_res.output:
-                if chunk:
-                    dst.write(chunk)
-
-        if not zipfile.is_zipfile(tmp_path):
-            os.remove(tmp_path)
-            raise HTTPException(status_code=500, detail="Downloaded Excel appears invalid/corrupted")
-
-        sha256 = hashlib.sha256()
-        with open(tmp_path, "rb") as f:
-            for b in iter(lambda: f.read(1 << 20), b""):
-                sha256.update(b)
-        digest = sha256.hexdigest()
-
-        background_tasks.add_task(lambda p=tmp_path: os.path.exists(p) and os.remove(p))
-
-        headers = {
-            "Content-Disposition": f"attachment; filename={download_name}; filename*=UTF-8''{download_name}",
-            "Cache-Control": "no-transform",
-            "X-File-SHA256": digest,
-        }
-        return FileResponse(
-            path=tmp_path,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=download_name,
-            headers=headers,
-            background=background_tasks,
-        )
-    finally:
-        if helper is not None:
-            try:
-                helper.remove(force=True)
-            except Exception:
-                pass
 
 # ------------- Download filtered_report.md -------------
 @app.get("/jobs/{job_id}/download/filtered-report")
@@ -1290,16 +1178,18 @@ async def download_price_adjustment_explanation(job_id: str):
     try:
         result = docker_client.containers.run(
             "alpine:latest",
-            command=f"sh -c 'cat {shlex.quote(base)}/models/price_adjustment_explanation_latest.md'",
+            command=f"sh -c 'cat {shlex.quote(base)}/reports/price_adjustment_explanation_latest.md'",
             volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
             remove=True,
             detach=False
         )
         if not result:
             raise HTTPException(status_code=404, detail="Price adjustment explanation not found")
-
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_price_adjustment_explanation_latest.md"'}
-        return StreamingResponse(BytesIO(result), media_type='text/markdown', headers=headers)
+        md_content = result.decode('utf-8')
+        pdf_bytes = convert_md_to_pdf(md_content, ticker)
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_price_adjustment_explanation_latest.pdf"'}
+        return StreamingResponse(BytesIO(pdf_bytes), media_type='application/pdf', headers=headers)
+        
     except HTTPException:
         raise
     except Exception as e:
@@ -1347,7 +1237,7 @@ async def list_job_files(job_id: str):
         try:
             docker_client.containers.run(
                 "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/screening_report.md",
+                command=f"test -f {shlex.quote(base)}/screened/screening_report.md",
                 volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
                 remove=True,
                 detach=False
@@ -1360,7 +1250,7 @@ async def list_job_files(job_id: str):
         try:
             docker_client.containers.run(
                 "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/screening_data.json",
+                command=f"test -f {shlex.quote(base)}/screened/screening_data.json",
                 volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
                 remove=True,
                 detach=False
@@ -1425,7 +1315,7 @@ async def list_job_files(job_id: str):
         try:
             docker_client.containers.run(
                 "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/filtered_report.md",
+                command=f"test -f {shlex.quote(base)}/filtered/filtered_report.md",
                 volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
                 remove=True,
                 detach=False
@@ -1438,7 +1328,7 @@ async def list_job_files(job_id: str):
         try:
             docker_client.containers.run(
                 "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/models/price_adjustment_explanation_latest.md",
+                command=f"test -f {shlex.quote(base)}/reports/price_adjustment_explanation_latest.md",
                 volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
                 remove=True,
                 detach=False
