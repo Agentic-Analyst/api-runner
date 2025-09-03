@@ -121,9 +121,9 @@ class NLAgent:
             return False
             
         # Basic ticker format validation (2-5 uppercase letters, possibly with dash)
-        if not re.match(r'^[A-Z]{2,5}(-[A-Z])?$', ticker):
-            self.logger.warning(f"Ticker format invalid: {ticker}")
-            return False
+        # if not re.match(r'^[A-Z]{2,5}(-[A-Z])?$', ticker):
+        #     self.logger.warning(f"Ticker format invalid: {ticker}")
+        #     return False
             
         self.logger.info("All required arguments are identified from the user request.")
         return True
