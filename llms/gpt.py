@@ -72,7 +72,7 @@ def gpt_4o_mini(messages: List[Dict], temperature: float = 0.3) -> Tuple[str, fl
             cost = calculate_cost(response, "gpt-4o-mini")
             if logger:
                 logger.info(f"LLM call succeeded (attempt {attempt + 1}/{max_retries})")
-                logger.info("gpt-4o-mini", cost, response.usage.total_tokens)
+                logger.info(f"gpt-4o-mini cost: ${cost:.6f}, tokens: {response.usage.total_tokens}")
             else:
                 print(f"[llm] LLM call succeeded (attempt {attempt + 1}/{max_retries})")
 
