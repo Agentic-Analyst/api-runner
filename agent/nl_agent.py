@@ -100,8 +100,29 @@ class NLAgent:
             .strip()
         )
 
-        # 4) Final parse
-        return json.loads(s)
+        # 4) Parse JSON
+        parsed = json.loads(s)
+        
+        # 5) Post-process to fix common LLM mistakes with data types
+        if isinstance(parsed, dict):
+            cleaned = {}
+            for key, value in parsed.items():
+                # Convert single-item lists to their single values
+                if isinstance(value, list) and len(value) == 1:
+                    self.logger.warning(f"Converting single-item list to value for {key}: {value} -> {value[0]}")
+                    cleaned[key] = value[0]
+                elif isinstance(value, list) and len(value) == 0:
+                    self.logger.warning(f"Ignoring empty list for {key}")
+                    # Skip empty lists
+                    continue
+                elif isinstance(value, list) and len(value) > 1:
+                    self.logger.warning(f"Multiple values in list for {key}: {value}, taking first: {value[0]}")
+                    cleaned[key] = value[0]
+                else:
+                    cleaned[key] = value
+            return cleaned
+        
+        return parsed
 
     def validate_args(self, args: Dict[str, Any]) -> bool:
         """

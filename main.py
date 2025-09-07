@@ -204,6 +204,70 @@ def process_nl_request(nl_req: NLRequest) -> JobRequest:
     Process natural language request through NLAgent and merge with provided parameters.
     Provided parameters take priority over NL-extracted ones.
     """
+    
+    def safe_convert_value(value, expected_type, param_name):
+        """
+        Safely convert LLM-extracted values to expected types with proper error handling.
+        """
+        if value is None:
+            return None
+            
+        try:
+            # Handle string parameters
+            if expected_type == str:
+                if isinstance(value, list):
+                    if len(value) > 0:
+                        # If it's a list, take the first element and convert to string
+                        return str(value[0])
+                    else:
+                        # Empty list
+                        logger.warning(f"Empty list provided for {param_name}")
+                        return None
+                elif isinstance(value, (str, int, float)):
+                    return str(value)
+                else:
+                    logger.warning(f"Unexpected type for {param_name}: {type(value)}, value: {value}")
+                    return str(value)
+            
+            # Handle integer parameters
+            elif expected_type == int:
+                if isinstance(value, list):
+                    if len(value) > 0:
+                        return int(float(value[0]))  # Handle case where list contains string numbers
+                    else:
+                        logger.warning(f"Empty list provided for {param_name}")
+                        return None
+                elif isinstance(value, (int, float)):
+                    return int(value)
+                elif isinstance(value, str):
+                    return int(float(value))  # Handle string numbers
+                else:
+                    logger.warning(f"Cannot convert {param_name} to int: {value}")
+                    return None
+            
+            # Handle float parameters
+            elif expected_type == float:
+                if isinstance(value, list):
+                    if len(value) > 0:
+                        return float(value[0])
+                    else:
+                        logger.warning(f"Empty list provided for {param_name}")
+                        return None
+                elif isinstance(value, (int, float)):
+                    return float(value)
+                elif isinstance(value, str):
+                    return float(value)
+                else:
+                    logger.warning(f"Cannot convert {param_name} to float: {value}")
+                    return None
+            
+            # Default: return as-is
+            return value
+            
+        except (ValueError, TypeError, IndexError) as e:
+            logger.warning(f"Error converting {param_name} (value: {value}): {e}")
+            return None
+    
     try:
         # Use NLAgent to extract parameters from the request
         nl_agent = NLAgent()
@@ -219,7 +283,7 @@ def process_nl_request(nl_req: NLRequest) -> JobRequest:
         if nl_req.ticker:
             final_args['ticker'] = nl_req.ticker
         elif extracted_args.get('ticker'):
-            final_args['ticker'] = extracted_args['ticker']
+            final_args['ticker'] = safe_convert_value(extracted_args['ticker'], str, 'ticker')
         else:
             raise ValueError("No ticker found in request or provided parameters")
             
@@ -227,9 +291,9 @@ def process_nl_request(nl_req: NLRequest) -> JobRequest:
         if nl_req.company:
             final_args['company'] = nl_req.company
         elif extracted_args.get('company_name'):
-            final_args['company'] = extracted_args['company_name']
+            final_args['company'] = safe_convert_value(extracted_args['company_name'], str, 'company_name')
         elif extracted_args.get('company'):
-            final_args['company'] = extracted_args['company']
+            final_args['company'] = safe_convert_value(extracted_args['company'], str, 'company')
         else:
             raise ValueError("No company found in request or provided parameters")
             
@@ -237,27 +301,30 @@ def process_nl_request(nl_req: NLRequest) -> JobRequest:
         final_args['email'] = nl_req.email
         
         # For other parameters, prefer provided, then extracted, then None (use defaults)
+        # Define expected types for validation
         param_mapping = {
-            'pipeline': 'pipeline',
-            'model': 'model', 
-            'years': 'years',
-            'term_growth': 'term_growth',
-            'wacc': 'wacc',
-            'strategy': 'strategy',
-            'max_articles': 'max_articles',
-            'min_score': 'min_score',
-            'max_filtered': 'max_filtered',
-            'min_confidence': 'min_confidence',
-            'scaling': 'scaling',
-            'adjustment_cap': 'adjustment_cap'
+            'pipeline': ('pipeline', str),
+            'model': ('model', str), 
+            'years': ('years', int),
+            'term_growth': ('term_growth', float),
+            'wacc': ('wacc', float),
+            'strategy': ('strategy', str),
+            'max_articles': ('max_articles', int),
+            'min_score': ('min_score', float),
+            'max_filtered': ('max_filtered', int),
+            'min_confidence': ('min_confidence', float),
+            'scaling': ('scaling', float),
+            'adjustment_cap': ('adjustment_cap', float)
         }
         
-        for param_name, extracted_key in param_mapping.items():
+        for param_name, (extracted_key, expected_type) in param_mapping.items():
             provided_value = getattr(nl_req, param_name, None)
             if provided_value is not None:
                 final_args[param_name] = provided_value
             elif extracted_args.get(extracted_key) is not None:
-                final_args[param_name] = extracted_args[extracted_key]
+                converted_value = safe_convert_value(extracted_args[extracted_key], expected_type, param_name)
+                if converted_value is not None:
+                    final_args[param_name] = converted_value
             # else: leave as None to use defaults
         
         logger.info(f"Final merged parameters: {final_args}")
