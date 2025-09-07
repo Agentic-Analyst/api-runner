@@ -182,6 +182,7 @@ class NLRequest(BaseModel):
 
 class JobResponse(BaseModel):
     job_id: str
+    ticker: str
     status: str
     message: str
 
@@ -355,7 +356,7 @@ async def monitor_info_log(job_id: str, container):
                                         if len(jobs[job_id]["recent_logs"]) > 100:
                                             jobs[job_id]["recent_logs"].pop(0)
 
-                                        if "🏁 THE ENTIRE PROGRAM IS COMPLETED" in line:
+                                        if "THE ENTIRE PROGRAM IS COMPLETED" in line:
                                             jobs[job_id]["progress"] = "Analysis completed successfully"
                                             jobs[job_id]["status"] = "completed"
                                         elif "STAGE: ARTICLE SCRAPING" in line:
@@ -388,7 +389,7 @@ async def monitor_info_log(job_id: str, container):
                                 for line in final_content.split('\n'):
                                     if line.strip():
                                         jobs[job_id].setdefault("recent_logs", []).append(line.strip())
-                                        if "🏁 THE ENTIRE PROGRAM IS COMPLETED" in line:
+                                        if "THE ENTIRE PROGRAM IS COMPLETED" in line:
                                             jobs[job_id]["status"] = "completed"
                                             jobs[job_id]["progress"] = "Analysis completed successfully"
                         except:
@@ -682,8 +683,8 @@ async def process_nl_request_endpoint(nl_req: NLRequest, background_tasks: Backg
             job_request.max_filtered, job_request.min_confidence, job_request.scaling, job_request.adjustment_cap,
         )
 
-        return JobResponse(job_id=job_id, status="pending", message=f"Natural language analysis job started for {job_request.ticker}")
-        
+        return JobResponse(job_id=job_id, ticker=job_request.ticker, status="pending", message=f"Natural language analysis job started for {job_request.ticker}")
+
     except Exception as e:
         logger.error(f"Error in NL request processing: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to process request: {str(e)}")
@@ -852,7 +853,7 @@ async def get_job_logs_stream(job_id: str):
                 if "ENTIRE PROGRAM" in line:
                     job["status"] = "completed"
                     job["progress"] = "Analysis completed successfully"
-                    yield sse("completed", "🏁 THE ENTIRE PROGRAM IS COMPLETED")
+                    yield sse("completed", "The entire program is completed")
                 else:
                     yield sse("log", line)
             pending_line = pending
