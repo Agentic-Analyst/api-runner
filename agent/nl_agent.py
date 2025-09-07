@@ -107,8 +107,24 @@ class NLAgent:
         if isinstance(parsed, dict):
             cleaned = {}
             for key, value in parsed.items():
-                # Convert single-item lists to their single values
-                if isinstance(value, list) and len(value) == 1:
+                # Special handling for peers - convert list to comma-separated string
+                if key == 'peers' and isinstance(value, list):
+                    if len(value) > 0:
+                        # Join all values with commas, stripping whitespace and converting to uppercase
+                        peer_list = [str(v).strip().upper() for v in value if str(v).strip()]
+                        if peer_list:
+                            cleaned[key] = ','.join(peer_list)
+                            self.logger.info(f"Converting peer list to comma-separated string: {value} -> {cleaned[key]}")
+                        else:
+                            self.logger.warning(f"Empty peer list after filtering: {value}")
+                            # Skip empty peer lists
+                            continue
+                    else:
+                        self.logger.warning(f"Ignoring empty peer list for {key}")
+                        # Skip empty lists
+                        continue
+                # Convert single-item lists to their single values (for non-peers)
+                elif isinstance(value, list) and len(value) == 1:
                     self.logger.warning(f"Converting single-item list to value for {key}: {value} -> {value[0]}")
                     cleaned[key] = value[0]
                 elif isinstance(value, list) and len(value) == 0:

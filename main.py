@@ -153,6 +153,7 @@ class JobRequest(BaseModel):
     term_growth: Optional[float] = Field(default=None, description="Terminal growth rate (auto-inferred)")
     wacc: Optional[float] = Field(default=None, description="Override WACC (auto-inferred)")
     strategy: Optional[str] = Field(default=None, description="Force specific forecast strategy")
+    peers: Optional[str] = Field(default=None, description="Comma-separated peer tickers for comparable analysis (e.g., 'AAPL,MSFT,GOOGL')")
     max_articles: Optional[int] = Field(default=None, description="Maximum articles to scrape (default: 20)")
     min_score: Optional[float] = Field(default=None, description="Minimum relevance score (default: 3.0)")
     max_filtered: Optional[int] = Field(default=None, description="Maximum filtered articles (default: 10)")
@@ -173,6 +174,7 @@ class NLRequest(BaseModel):
     term_growth: Optional[float] = Field(default=None, description="Terminal growth rate (auto-inferred)")
     wacc: Optional[float] = Field(default=None, description="Override WACC (auto-inferred)")
     strategy: Optional[str] = Field(default=None, description="Force specific forecast strategy")
+    peers: Optional[str] = Field(default=None, description="Comma-separated peer tickers for comparable analysis (e.g., 'AAPL,MSFT,GOOGL')")
     max_articles: Optional[int] = Field(default=None, description="Maximum articles to scrape (default: 20)")
     min_score: Optional[float] = Field(default=None, description="Minimum relevance score (default: 3.0)")
     max_filtered: Optional[int] = Field(default=None, description="Maximum filtered articles (default: 10)")
@@ -217,14 +219,37 @@ def process_nl_request(nl_req: NLRequest) -> JobRequest:
             if expected_type == str:
                 if isinstance(value, list):
                     if len(value) > 0:
-                        # If it's a list, take the first element and convert to string
-                        return str(value[0])
+                        # Special handling for peers parameter - convert list to comma-separated string
+                        if param_name == 'peers':
+                            # Join all values with commas, stripping whitespace
+                            peer_list = [str(v).strip().upper() for v in value if str(v).strip()]
+                            if peer_list:
+                                logger.info(f"Converting peer list to comma-separated string: {value} -> {','.join(peer_list)}")
+                                return ','.join(peer_list)
+                            else:
+                                logger.warning(f"Empty peer list after filtering: {value}")
+                                return None
+                        else:
+                            # For other string parameters, take the first element
+                            return str(value[0])
                     else:
                         # Empty list
                         logger.warning(f"Empty list provided for {param_name}")
                         return None
                 elif isinstance(value, (str, int, float)):
-                    return str(value)
+                    # For peers, ensure it's properly formatted (uppercase, no extra spaces)
+                    if param_name == 'peers':
+                        # Clean up comma-separated peer string
+                        peers_str = str(value).strip()
+                        if peers_str:
+                            peer_list = [p.strip().upper() for p in peers_str.split(',') if p.strip()]
+                            if peer_list:
+                                cleaned_peers = ','.join(peer_list)
+                                logger.info(f"Cleaned peer string: {value} -> {cleaned_peers}")
+                                return cleaned_peers
+                        return None
+                    else:
+                        return str(value)
                 else:
                     logger.warning(f"Unexpected type for {param_name}: {type(value)}, value: {value}")
                     return str(value)
@@ -309,6 +334,7 @@ def process_nl_request(nl_req: NLRequest) -> JobRequest:
             'term_growth': ('term_growth', float),
             'wacc': ('wacc', float),
             'strategy': ('strategy', str),
+            'peers': ('peers', str),
             'max_articles': ('max_articles', int),
             'min_score': ('min_score', float),
             'max_filtered': ('max_filtered', int),
@@ -481,6 +507,7 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
                          pipeline: Optional[str] = None, model: Optional[str] = None, 
                          years: Optional[int] = None, term_growth: Optional[float] = None,
                          wacc: Optional[float] = None, strategy: Optional[str] = None,
+                         peers: Optional[str] = None,
                          max_articles: Optional[int] = None, min_score: Optional[float] = None, 
                          max_filtered: Optional[int] = None, min_confidence: Optional[float] = None,
                          scaling: Optional[float] = None, adjustment_cap: Optional[float] = None):
@@ -516,6 +543,8 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
             cmd.extend(["--wacc", str(wacc)])
         if strategy:
             cmd.extend(["--strategy", strategy])
+        if peers:
+            cmd.extend(["--peers", peers])
         if max_articles is not None:
             cmd.extend(["--max-articles", str(max_articles)])
         if min_score is not None:
@@ -692,7 +721,7 @@ async def start_analysis(job: JobRequest, background_tasks: BackgroundTasks):
         job_id, job.ticker, job.company,
         user_email, current_timestamp,
         job.pipeline, job.model, job.years, job.term_growth,
-        job.wacc, job.strategy, job.max_articles, job.min_score,
+        job.wacc, job.strategy, job.peers, job.max_articles, job.min_score,
         job.max_filtered, job.min_confidence, job.scaling, job.adjustment_cap,
     )
 
@@ -746,7 +775,7 @@ async def process_nl_request_endpoint(nl_req: NLRequest, background_tasks: Backg
             job_id, job_request.ticker, job_request.company,
             user_email, current_timestamp,
             job_request.pipeline, job_request.model, job_request.years, job_request.term_growth,
-            job_request.wacc, job_request.strategy, job_request.max_articles, job_request.min_score,
+            job_request.wacc, job_request.strategy, job_request.peers, job_request.max_articles, job_request.min_score,
             job_request.max_filtered, job_request.min_confidence, job_request.scaling, job_request.adjustment_cap,
         )
 
@@ -779,6 +808,7 @@ async def test_nl_processing(nl_req: NLRequest):
                 "term_growth": job_request.term_growth,
                 "wacc": job_request.wacc,
                 "strategy": job_request.strategy,
+                "peers": job_request.peers,
                 "max_articles": job_request.max_articles,
                 "min_score": job_request.min_score,
                 "max_filtered": job_request.max_filtered,
@@ -1387,6 +1417,94 @@ async def download_financials_annual(job_id: str):
         logger.error(f"Error downloading financials annual for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not read financials annual file: {str(e)}")
 
+# ------------- Download peer financials -------------
+@app.get("/jobs/{job_id}/download/peer-financials")
+async def download_peer_financials(job_id: str):
+    """
+    Download financials for all peer companies as a ZIP file.
+    Only includes peer financials, not the main company.
+    """
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not docker_client:
+        raise HTTPException(status_code=503, detail="Docker not available")
+
+    job = jobs[job_id]
+    base = job_root(job)
+    ticker = (job.get('ticker') or '').upper()
+
+    try:
+        # Find peer directories
+        peer_base = str(Path(base))  # Search /data/<email>/<TICKER>/<timestamp>
+        logger.info(f"Looking for peer directories in: {peer_base}")
+        
+        # First, let's see what directories actually exist
+        ls_result = docker_client.containers.run(
+            "alpine:latest",
+            command=f"sh -c 'ls -la {shlex.quote(peer_base)} 2>/dev/null || echo \"Directory not found\"'",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
+            remove=True,
+            detach=False
+        )
+        logger.info(f"Directory listing: {ls_result.decode('utf-8')}")
+        
+        peer_list_result = docker_client.containers.run(
+            "alpine:latest",
+            command=f"sh -c 'find {shlex.quote(peer_base)} -maxdepth 1 -type d -name \"temp_peer_*\" | head -20'",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
+            remove=True,
+            detach=False
+        )
+        
+        peer_dirs = [p.strip() for p in peer_list_result.decode('utf-8').splitlines() if p.strip()]
+        logger.info(f"Found peer directories: {peer_dirs}")
+        
+        if not peer_dirs:
+            raise HTTPException(status_code=404, detail=f"No peer financials found. Searched in: {peer_base}. Available directories: {ls_result.decode('utf-8').strip()}")
+        
+        # Create ZIP file with peer financials
+        buf = BytesIO()
+        peer_count = 0
+        
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for peer_dir in peer_dirs:
+                try:
+                    # Extract peer ticker from directory name (temp_peer_AAPL -> AAPL)
+                    peer_ticker = peer_dir.split('_')[-1].upper()
+                    peer_financials_path = f"{peer_dir}/financials/financials_annual_modeling_latest.json"
+                    
+                    peer_result = docker_client.containers.run(
+                        "alpine:latest",
+                        command=f"sh -c 'if [ -f {shlex.quote(peer_financials_path)} ]; then cat {shlex.quote(peer_financials_path)}; fi'",
+                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
+                        remove=True,
+                        detach=False
+                    )
+                    
+                    if peer_result:
+                        zipf.writestr(f"{peer_ticker}_financials_annual_modeling_latest.json", peer_result)
+                        peer_count += 1
+                        logger.info(f"Added peer financials for {peer_ticker}")
+                    else:
+                        logger.warning(f"No financials found for peer {peer_ticker}")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing peer financials for {peer_dir}: {e}")
+                    continue
+        
+        if peer_count == 0:
+            raise HTTPException(status_code=404, detail="No valid peer financial data found")
+        
+        buf.seek(0)
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_peer_financials_annual.zip"'}
+        return StreamingResponse(buf, media_type="application/zip", headers=headers)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating peer financials ZIP for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not create peer financials ZIP file: {str(e)}")
+
 # ------------- Download financial model Excel -------------
 @app.get("/jobs/{job_id}/download/financial-model")
 async def download_financial_model(job_id: str):
@@ -1504,6 +1622,7 @@ async def list_job_files(job_id: str):
             "searched_articles_count": 0,
             "filtered_articles_count": 0,
             "financials_annual": False,
+            "peer_financials": False,
             "financial_model": False,
             "filtered_report": False,
             "price_adjustment_explanation": False,
@@ -1624,6 +1743,20 @@ async def list_job_files(job_id: str):
             )
             files["price_adjustment_explanation"] = True
         except:
+            pass
+
+        # Check for peer financials
+        try:
+            peer_base = str(Path(base).parent)  # Go up one level
+            docker_client.containers.run(
+                "alpine:latest",
+                command=f"sh -c 'find {shlex.quote(peer_base)} -maxdepth 1 -type d -name \"temp_peer_*\" | head -20'",
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
+                remove=True,
+                detach=False
+            )
+            files["peer_financials"] = True   
+        except Exception:
             pass
 
         return {

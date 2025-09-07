@@ -17,6 +17,8 @@ You are a financial analyst assistant. Your task is to extract structured inform
 - NVIDIA → NVDA, "NVIDIA Corporation"
 - Meta/Facebook → META, "Meta Platforms Inc"
 - Netflix → NFLX, "Netflix Inc"
+- Intel → INTC, "Intel Corporation"
+- AMD → AMD, "Advanced Micro Devices Inc"
 
 **User Request:** {request}
 
@@ -29,6 +31,7 @@ You are a financial analyst assistant. Your task is to extract structured inform
 - term_growth: Float - Terminal growth rate (e.g., 0.025)
 - wacc: Float - Weighted average cost of capital (e.g., 0.08)
 - strategy: String - Forecast strategy
+- peers: String - Comma-separated peer tickers for comparable analysis (e.g., "AAPL,MSFT,GOOGL")
 - max_articles: Integer - Max articles to analyze (e.g., 20)
 - min_score: Float - Minimum relevance score 0-10 (e.g., 3.0)
 - max_filtered: Integer - Max filtered articles (e.g., 10)
@@ -45,7 +48,21 @@ You are a financial analyst assistant. Your task is to extract structured inform
 1. Extract the ticker and company name from the user request
 2. Identify the type of analysis requested and map it to the appropriate pipeline, only if it is mentioned in the prompt
 3. Extract any specific parameters mentioned (years, WACC, etc.)
-4. Return ONLY a JSON object with the identified parameters as SINGLE VALUES
+4. If peer companies or comparable companies are mentioned, extract them as a comma-separated string for the peers parameter
+5. Return ONLY a JSON object with the identified parameters as SINGLE VALUES
+
+**Peer Company Detection Examples:**
+- "Compare Apple with Microsoft and Google" → "MSFT,GOOGL"
+- "Analyze Tesla against Ford and GM" → "F,GM"
+- "DCF for NVIDIA with peers like AMD and Intel" → "AMD,INTC"
+- "Comparable analysis with similar tech companies" → (try to infer appropriate peers)
+- "Run comparable model against competitors" → (infer industry peers)
+- "Peer analysis with AAPL, MSFT, GOOGL" → "AAPL,MSFT,GOOGL"
+
+**Peer Detection Keywords:**
+- Look for: "compare with", "against", "peers", "competitors", "similar companies", "vs", "versus"
+- Industry contexts: "tech companies", "auto companies", "banks", "retailers"
+- When analysis type is "comparable", try to suggest relevant industry peers if not specified
 
 **Example Response Format:**
-Return only valid JSON like: {{"ticker": "AAPL", "company_name": "Apple Inc", "pipeline": "comprehensive", "model": "dcf", "years": 7}}
+Return only valid JSON like: {{"ticker": "AAPL", "company_name": "Apple Inc", "pipeline": "comprehensive", "model": "dcf", "years": 7, "peers": "MSFT,GOOGL"}}
