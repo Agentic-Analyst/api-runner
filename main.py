@@ -27,6 +27,7 @@ from io import BytesIO
 import shlex
 import codecs
 from fastapi import Request
+import subprocess
 
 import docker
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -327,7 +328,7 @@ async def monitor_info_log(job_id: str, container):
                         temp_container = docker_client.containers.run(
                             "alpine:latest",
                             command=f"sh -c 'if [ -f {shlex.quote(base)}/info.log ]; then wc -c {shlex.quote(base)}/info.log | cut -d\" \" -f1; else echo 0; fi'",
-                            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                             remove=True,
                             detach=False
                         )
@@ -338,7 +339,7 @@ async def monitor_info_log(job_id: str, container):
                             temp_container2 = docker_client.containers.run(
                                 "alpine:latest",
                                 command=f"sh -c 'if [ -f {shlex.quote(base)}/info.log ]; then tail -c +{last_info_log_size + 1} {shlex.quote(base)}/info.log; fi'",
-                                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                                 remove=True,
                                 detach=False
                             )
@@ -378,7 +379,7 @@ async def monitor_info_log(job_id: str, container):
                             final_temp = docker_client.containers.run(
                                 "alpine:latest",
                                 command=f"sh -c 'if [ -f {shlex.quote(base)}/info.log ]; then tail -c +{last_info_log_size + 1} {shlex.quote(base)}/info.log; fi'",
-                                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                                 remove=True,
                                 detach=False
                             )
@@ -816,7 +817,7 @@ async def get_job_logs_stream(job_id: str):
                 size_out = docker_client.containers.run(
                     "alpine:latest",
                     command=f"sh -lc 'if [ -f {shlex.quote(path)} ]; then wc -c < {shlex.quote(path)}; else echo 0; fi'",
-                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                    volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                     remove=True,
                     detach=False,
                 )
@@ -825,7 +826,7 @@ async def get_job_logs_stream(job_id: str):
                     content_out = docker_client.containers.run(
                         "alpine:latest",
                         command=f"sh -lc 'if [ -f {shlex.quote(path)} ]; then tail -c +{start_byte + 1} {shlex.quote(path)}; fi'",
-                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                         remove=True,
                         detach=False,
                     )
@@ -996,7 +997,7 @@ async def download_file(job_id: str, filename: str):
         result = docker_client.containers.run(
             "alpine:latest",
             command=f"sh -c 'cat {shlex.quote(path)}'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
             remove=True,
             detach=False
         )
@@ -1022,7 +1023,7 @@ async def get_info_log(job_id: str):
         temp_container = docker_client.containers.run(
             "alpine:latest",
             command=f"cat {shlex.quote(base)}/info.log",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
             remove=True,
             detach=False
         )
@@ -1053,7 +1054,7 @@ async def download_searched_articles(job_id: str):
         list_result = docker_client.containers.run(
             "alpine:latest",
             command=f"sh -c 'if [ -d {shlex.quote(base)}/searched ]; then find {shlex.quote(base)}/searched -name \"*.md\" -type f; fi'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
             remove=True,
             detach=False
         )
@@ -1069,7 +1070,7 @@ async def download_searched_articles(job_id: str):
                     content = docker_client.containers.run(
                         "alpine:latest",
                         command=f"sh -c 'cat {shlex.quote(path)}'",
-                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                         remove=True,
                         detach=False
                     )
@@ -1104,7 +1105,7 @@ async def download_filtered_articles(job_id: str):
         list_result = docker_client.containers.run(
             "alpine:latest",
             command=f"sh -c 'if [ -d {shlex.quote(base)}/filtered ]; then find {shlex.quote(base)}/filtered -name \"filtered_*.md\" -type f; fi'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
             remove=True,
             detach=False
         )
@@ -1119,7 +1120,7 @@ async def download_filtered_articles(job_id: str):
             idx = docker_client.containers.run(
                 "alpine:latest",
                 command=f"sh -c 'cat {shlex.quote(base)}/filtered/filtered_articles_index.csv'",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                 remove=True,
                 detach=False
             )
@@ -1134,7 +1135,7 @@ async def download_filtered_articles(job_id: str):
                     content = docker_client.containers.run(
                         "alpine:latest",
                         command=f"sh -c 'cat {shlex.quote(path)}'",
-                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                         remove=True,
                         detach=False
                     )
@@ -1172,7 +1173,7 @@ async def download_screening_report(job_id: str):
         result = docker_client.containers.run(
             "alpine:latest",
             command=f"sh -c 'cat {shlex.quote(base)}/screened/screening_report.md'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
             remove=True,
             detach=False
         )
@@ -1191,7 +1192,10 @@ async def download_screening_report(job_id: str):
 # ------------- Tar all results (entire timestamp folder) -------------
 @app.get("/jobs/{job_id}/download/all-results")
 async def download_all_results(job_id: str):
-    """Download ALL analysis results (entire /data/<email>/<TICKER>/<timestamp> folder) as a tar stream."""
+    """
+    Stream ALL analysis results (entire /data/<email>/<TICKER>/<timestamp>) as a tar.
+    No helper container; reads directly from the mounted volume inside this API container.
+    """
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -1199,59 +1203,90 @@ async def download_all_results(job_id: str):
     ticker = (job.get("ticker") or "").upper()
     if not ticker:
         raise HTTPException(status_code=400, detail="Ticker not found for job")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
 
-    base = job_root(job)  # /data/<email>/<TICKER>/<timestamp>
-    # provide a nice tarball name that includes ticker and timestamp
-    safe_ts = job.get("timestamp", "").replace(":", "-")
+    # Ensure docker client exists only if you use it elsewhere
+    # (Not needed for this endpoint, but leaving your global check pattern intact is fine.)
+
+    # Container-view path (this API container must mount the data volume at /data)
+    base = Path(job_root(job))  # e.g., /data/<email>/<TICKER>/<timestamp>
+
+    # Quick sanity: ensure the base path is under /data and exists
+    try:
+        base.relative_to("/data")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid job data path")
+
+    if not base.exists() or not base.is_dir():
+        raise HTTPException(status_code=404, detail="No data found for job")
+
+    # Nice tar filename
+    safe_ts = (job.get("timestamp") or "").replace(":", "-")
     tar_name = f"{ticker}_{safe_ts}_complete_analysis.tar"
 
-    extra_mounts = job.get("extra_mounts", [])  # future-proof
+    # Build the tar command: tar -C / -cf - -- data/<email>/<TICKER>/<timestamp>
+    # We tar from / so the archive contains "data/<email>/<TICKER>/<timestamp>" (no absolute paths).
+    tar_cmd = [
+        "tar", "-C", "/", "-cf", "-", "--", str(base).lstrip("/"),
+    ]
 
-    def tar_stream():
-        helper = None
+    def tar_generator():
+        proc = None
         try:
-            volumes = {DATA_VOLUME: {"bind": "/data", "mode": "ro"}}
-            for m in extra_mounts:
-                src = m.get("Source")
-                dst = m.get("Destination")
-                if src and dst:
-                    volumes[src] = {"bind": dst, "mode": m.get("Mode", "ro") or "ro"}
-
-            helper = docker_client.containers.create(
-                image="alpine:latest",
-                command="sleep 300",
-                volumes=volumes,
-                detach=True,
-                remove=False,
+            # Start subprocess without shell; safer and faster.
+            proc = subprocess.Popen(
+                tar_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
             )
-            helper.start()
 
-            # Ensure base exists
-            chk = helper.exec_run(f"sh -c 'test -d {shlex.quote(base)}'")
-            if chk.exit_code != 0:
-                raise HTTPException(status_code=404, detail="No data found for job")
+            # Stream stdout in chunks
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
 
-            # Stream tar of the timestamp folder; -C / to include absolute-like path under /data
-            # but we'll tar from / so the archive contains data/<email>/<TICKER>/<timestamp>
-            exec_res = helper.exec_run(
-                cmd=["tar", "-C", "/", "-cf", "-", "--", base.lstrip("/")],
-                stream=True,
-                demux=False,
-            )
-            for chunk in exec_res.output:
-                if chunk:
-                    yield chunk
+            # Wait for process to exit and check status
+            ret = proc.wait(timeout=10)
+            if ret != 0:
+                # Capture stderr to include in logs / error message
+                err = (proc.stderr.read() if proc.stderr else b"").decode("utf-8", "ignore")
+                logger.error("tar exited with code %s: %s", ret, err.strip())
+                # Raising here would break mid-stream for clients; at this point
+                # we've already ended the stream. Optionally you can log only.
+        except Exception as e:
+            logger.error("Error streaming tar for %s: %s", job_id, e)
+            # If something goes wrong early, yield nothing further and let the client see an incomplete stream.
+            # Alternatively, re-raise to let FastAPI return a 500 before sending any bytes.
+            # raise
         finally:
-            if helper is not None:
+            # Best-effort cleanup
+            if proc is not None:
                 try:
-                    helper.remove(force=True)
+                    if proc.poll() is None:
+                        proc.kill()
+                except Exception:
+                    pass
+                try:
+                    if proc.stderr:
+                        _ = proc.stderr.read()
                 except Exception:
                     pass
 
-    headers = {"Content-Disposition": f'attachment; filename="{tar_name}"'}
-    return StreamingResponse(tar_stream(), media_type="application/x-tar", headers=headers)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{tar_name}"',
+        "Cache-Control": "no-store, private",
+        # Disable proxy buffering to start download immediately (helps behind Caddy/Nginx)
+        "X-Accel-Buffering": "no",
+    }
+
+    return StreamingResponse(
+        tar_generator(),
+        media_type="application/x-tar",
+        headers=headers,
+    )
 
 # ------------- Download financials_annual JSON -------------
 @app.get("/jobs/{job_id}/download/financials-annual")
@@ -1269,7 +1304,7 @@ async def download_financials_annual(job_id: str):
         result = docker_client.containers.run(
             "alpine:latest",
             command=f"sh -c 'cat {shlex.quote(base)}/financials/financials_annual_modeling_latest.json'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
             remove=True,
             detach=False
         )
@@ -1285,41 +1320,37 @@ async def download_financials_annual(job_id: str):
         raise HTTPException(status_code=500, detail=f"Could not read financials annual file: {str(e)}")
 
 # ------------- Download financial model Excel -------------
-STABILITY_CHECK_INTERVAL = 0.5
-STABILITY_CHECKS = 3
-COPY_TIMEOUT_SEC = 60
-
 @app.get("/jobs/{job_id}/download/financial-model")
 async def download_financial_model(job_id: str):
-    """Download the financial_model_comprehensive_latest.xlsx file"""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
 
     job = jobs[job_id]
-    base = job_root(job)
-    ticker = (job.get('ticker') or '').upper()
-    
-    try:
-        # Read the financial model Excel file
-        result = docker_client.containers.run(
-            "alpine:latest",
-            command=f"sh -c 'cat {shlex.quote(base)}/models/financial_model_comprehensive_latest.xlsx'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
-            remove=True,
-            detach=False
-        )
-        if not result:
-            raise HTTPException(status_code=404, detail="Financial model Excel not found")
+    ticker = (job.get("ticker") or "").upper()
 
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_financial_model_comprehensive_latest.xlsx"'}
-        return StreamingResponse(BytesIO(result), media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers=headers)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error downloading financial model for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not read financial model file: {str(e)}")
+    # Container-side path (the API container sees the volume at /data)
+    base = Path(job_root(job))  # e.g. /data/<email>/<TICKER>/<timestamp>
+    xlsx_path = base / "models" / "financial_model_comprehensive_latest.xlsx"
+
+    # Optional: small stability wait to avoid half-written ZIP
+    for _ in range(6):  # up to ~3s
+        if xlsx_path.exists() and xlsx_path.stat().st_size > 0:
+            break
+        time.sleep(0.5)
+
+    if not xlsx_path.exists():
+        raise HTTPException(status_code=404, detail="Financial model Excel not found")
+
+    return FileResponse(
+        path=str(xlsx_path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"{ticker}_financial_model_comprehensive_latest.xlsx",
+        headers={
+            "Cache-Control": "no-store, private",
+            "Content-Disposition": f'attachment; filename="{ticker}_financial_model_comprehensive_latest.xlsx"',
+            "Content-Transfer-Encoding": "binary",
+        },
+    )
 
 
 # ------------- Download filtered_report.md -------------
@@ -1337,8 +1368,8 @@ async def download_filtered_report(job_id: str):
     try:
         result = docker_client.containers.run(
             "alpine:latest",
-            command=f"sh -c 'cat {shlex.quote(base)}/filtered_report.md'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            command=f"sh -c 'cat {shlex.quote(base)}/filtered/filtered_report.md'",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
             remove=True,
             detach=False
         )
@@ -1369,7 +1400,7 @@ async def download_price_adjustment_explanation(job_id: str):
         result = docker_client.containers.run(
             "alpine:latest",
             command=f"sh -c 'cat {shlex.quote(base)}/reports/price_adjustment_explanation_latest.md'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
             remove=True,
             detach=False
         )
@@ -1415,7 +1446,7 @@ async def list_job_files(job_id: str):
             docker_client.containers.run(
                 "alpine:latest",
                 command=f"test -f {shlex.quote(base)}/info.log",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                 remove=True,
                 detach=False
             )
@@ -1428,7 +1459,7 @@ async def list_job_files(job_id: str):
             docker_client.containers.run(
                 "alpine:latest",
                 command=f"test -f {shlex.quote(base)}/screened/screening_report.md",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                 remove=True,
                 detach=False
             )
@@ -1441,7 +1472,7 @@ async def list_job_files(job_id: str):
             docker_client.containers.run(
                 "alpine:latest",
                 command=f"test -f {shlex.quote(base)}/screened/screening_data.json",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                 remove=True,
                 detach=False
             )
@@ -1454,7 +1485,7 @@ async def list_job_files(job_id: str):
             searched_list = docker_client.containers.run(
                 "alpine:latest",
                 command=f"sh -c 'if [ -d {shlex.quote(base)}/searched ]; then ls {shlex.quote(base)}/searched/*.md 2>/dev/null | wc -l; else echo 0; fi'",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                 remove=True,
                 detach=False
             )
@@ -1467,7 +1498,7 @@ async def list_job_files(job_id: str):
             filtered_list = docker_client.containers.run(
                 "alpine:latest",
                 command=f"sh -c 'if [ -d {shlex.quote(base)}/filtered ]; then ls {shlex.quote(base)}/filtered/filtered_*.md 2>/dev/null | wc -l; else echo 0; fi'",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                 remove=True,
                 detach=False
             )
@@ -1480,7 +1511,7 @@ async def list_job_files(job_id: str):
             docker_client.containers.run(
                 "alpine:latest",
                 command=f"test -f {shlex.quote(base)}/financials/financials_annual_modeling_latest.json",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                 remove=True,
                 detach=False
             )
@@ -1493,7 +1524,7 @@ async def list_job_files(job_id: str):
             docker_client.containers.run(
                 "alpine:latest",
                 command=f"test -f {shlex.quote(base)}/models/financial_model_comprehensive_latest.xlsx",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                 remove=True,
                 detach=False
             )
@@ -1506,7 +1537,7 @@ async def list_job_files(job_id: str):
             docker_client.containers.run(
                 "alpine:latest",
                 command=f"test -f {shlex.quote(base)}/filtered/filtered_report.md",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                 remove=True,
                 detach=False
             )
@@ -1519,7 +1550,7 @@ async def list_job_files(job_id: str):
             docker_client.containers.run(
                 "alpine:latest",
                 command=f"test -f {shlex.quote(base)}/reports/price_adjustment_explanation_latest.md",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'ro'}},
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
                 remove=True,
                 detach=False
             )
