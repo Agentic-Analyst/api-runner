@@ -15,6 +15,14 @@ You'll need API keys for the stock analyst backend:
 - **SERPAPI_API_KEY**: Get from [SerpApi](https://serpapi.com/)
 - **OPENAI_API_KEY**: Get from [OpenAI](https://platform.openai.com/api-keys)
 
+### Upload to Hetzner
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t fuzanwenn/api-runner:latest \
+  --push .
+
+#### In the server
+docker compose pull api && docker compose up -d api
+
 ### Local Development
 
 1. Create a virtual environment:

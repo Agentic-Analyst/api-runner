@@ -66,11 +66,11 @@ def _csv_env(name: str, default: str = "") -> List[str]:
     return vals
 
 # --- Env ---
-FRONTEND_ORIGINS = _csv_env("FRONTEND_ORIGIN", "http://localhost:3000")
-ROOT_PATH = os.getenv("ROOT_PATH", "")
-SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-session-secret-change-me")
-SESSION_HTTPS_ONLY = os.getenv("SESSION_HTTPS_ONLY", "false").lower() == "true"
-SESSION_STORE_COOKIE = os.getenv("SESSION_STORE_COOKIE", "app_session")
+FRONTEND_ORIGINS = _csv_env("FRONTEND_ORIGIN")
+ROOT_PATH = os.getenv("ROOT_PATH")
+SESSION_SECRET = os.getenv("SESSION_SECRET")
+SESSION_HTTPS_ONLY = os.getenv("SESSION_HTTPS_ONLY").lower() == "true"
+SESSION_STORE_COOKIE = os.getenv("SESSION_STORE_COOKIE")
 
 # SameSite configuration
 SESSION_SAMESITE = os.getenv("SESSION_SAMESITE", "lax").lower()
@@ -96,6 +96,7 @@ middleware = [
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["Content-Disposition"],
     ),
 ]
 
