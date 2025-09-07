@@ -1538,6 +1538,38 @@ async def download_financial_model(job_id: str):
         },
     )
 
+@app.get("/jobs/{job_id}/download/financial-model-comparable")
+async def download_financial_model_comparable(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs[job_id]
+    ticker = (job.get("ticker") or "").upper()
+
+    # Container-side path (the API container sees the volume at /data)
+    base = Path(job_root(job))  # e.g. /data/<email>/<TICKER>/<timestamp>
+    xlsx_path = base / "models" / "financial_model_comparable_latest.xlsx"
+
+    # Optional: small stability wait to avoid half-written ZIP
+    for _ in range(6):  # up to ~3s
+        if xlsx_path.exists() and xlsx_path.stat().st_size > 0:
+            break
+        time.sleep(0.5)
+
+    if not xlsx_path.exists():
+        raise HTTPException(status_code=404, detail="Financial model Excel not found")
+
+    return FileResponse(
+        path=str(xlsx_path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"{ticker}_financial_model_comparable_latest.xlsx",
+        headers={
+            "Cache-Control": "no-store, private",
+            "Content-Disposition": f'attachment; filename="{ticker}_financial_model_comparable_latest.xlsx"',
+            "Content-Transfer-Encoding": "binary",
+        },
+    )
+
 
 # ------------- Download filtered_report.md -------------
 @app.get("/jobs/{job_id}/download/filtered-report")
@@ -1624,6 +1656,7 @@ async def list_job_files(job_id: str):
             "financials_annual": False,
             "peer_financials": False,
             "financial_model": False,
+            "financial_model_comparable": False,
             "filtered_report": False,
             "price_adjustment_explanation": False,
         }
@@ -1716,6 +1749,18 @@ async def list_job_files(job_id: str):
                 detach=False
             )
             files["financial_model"] = True
+        except:
+            pass
+
+        try:
+            docker_client.containers.run(
+                "alpine:latest",
+                command=f"test -f {shlex.quote(base)}/models/financial_model_comparable_latest.xlsx",
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
+                remove=True,
+                detach=False
+            )
+            files["financial_model_comparable"] = True
         except:
             pass
 
