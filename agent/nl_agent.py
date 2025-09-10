@@ -41,35 +41,92 @@ class NLAgent:
     def process_request(self, request: str):
         """Process natural language request and return structured arguments."""
         try:
-            # First attempt with LLM
+            # Load and format prompt
             prompt_path = pathlib.Path(PROCESS_REQUEST)
             with open(prompt_path, 'r', encoding='utf-8') as f:
                 prompt_template = f.read()
             
-            # Format the prompt with request
             prompt = prompt_template.format(request=request)
             msgs = [
-                {"role": "system", "content": "You are a financial analyst that extracts structured information from user requests. Always return valid JSON."},
+                {"role": "system", "content": "You are a financial analyst that extracts structured information from user requests. Always return valid JSON with inferred pipeline and query when needed."},
                 {"role": "user", "content": prompt},
             ]
             
             resp, _ = self.llm_function(msgs)
             
-            # Parse JSON response
+            # Parse and validate JSON response
             try:
                 json_response = self.parse_llm_json(resp)
+                self.logger.info(f"Parsed LLM response: {json_response}")
             except json.JSONDecodeError as e:
                 raise ValueError(f"Failed to parse LLM JSON response: {e}\n{resp}")
             
+            # Set default pipeline if not provided
+            if 'pipeline' not in json_response:
+                json_response['pipeline'] = 'comprehensive'
+                self.logger.info("No pipeline specified, defaulting to 'comprehensive'")
+            
+            # Generate query if needed and not provided
+            pipeline = json_response.get('pipeline', 'comprehensive')
+            if pipeline in ['comprehensive', 'search-news', 'screen-news', 'news-to-price'] and 'query' not in json_response:
+                # Auto-generate query based on company and common search patterns
+                ticker = json_response.get('ticker', '')
+                company = json_response.get('company_name', '')
+                json_response['query'] = self.generate_search_query(ticker, company, request)
+                self.logger.info(f"Auto-generated query for {pipeline}: {json_response['query']}")
+            
             # Final validation
             if not self.validate_args(json_response):
-                raise ValueError(f"Could not identify ticker and company from request\n{resp}")
+                raise ValueError(f"Could not identify required parameters from request\n{resp}")
 
-            self.logger.info(f"Successfully processed request for {json_response.get('ticker', 'Unknown')}")
+            self.logger.info(f"Successfully processed request for {json_response.get('ticker', 'Unknown')} with pipeline: {json_response.get('pipeline', 'Unknown')}")
             return json_response
             
         except Exception as e:
             raise ValueError(f"Failed to process NL Agent request: {e}")
+    
+    def generate_search_query(self, ticker: str, company: str, original_request: str) -> str:
+        """Generate a search query based on ticker, company, and original request."""
+        # Extract key terms from the original request
+        request_lower = original_request.lower()
+        
+        # Common financial terms to look for
+        financial_terms = {
+            'earnings': ['earnings', 'profit', 'income', 'revenue'],
+            'growth': ['growth', 'expansion', 'increase'],
+            'decline': ['decline', 'drop', 'fall', 'decrease'],
+            'merger': ['merger', 'acquisition', 'deal', 'buyout'],
+            'product': ['product', 'launch', 'release', 'new'],
+            'guidance': ['guidance', 'outlook', 'forecast', 'projection'],
+            'regulatory': ['regulation', 'regulatory', 'legal', 'lawsuit'],
+            'competition': ['competition', 'competitor', 'rival', 'vs']
+        }
+        
+        # Check for specific terms in the request
+        detected_terms = []
+        for category, terms in financial_terms.items():
+            if any(term in request_lower for term in terms):
+                detected_terms.append(category)
+        
+        # Build query based on detected terms
+        if detected_terms:
+            primary_term = detected_terms[0]
+            query = f"{ticker} {primary_term}"
+        else:
+            # Default to recent news
+            query = f"{ticker} news"
+        
+        # Add temporal context if mentioned
+        if any(word in request_lower for word in ['recent', 'latest', 'new', 'today']):
+            query += " latest"
+        elif any(word in request_lower for word in ['q1', 'q2', 'q3', 'q4', 'quarter']):
+            query += " quarterly"
+        elif any(word in request_lower for word in ['2024', '2025']):
+            year_match = re.search(r'202[4-9]', original_request)
+            if year_match:
+                query += f" {year_match.group()}"
+        
+        return query
 
     def llm_function(self, msgs: List[Dict[str, str]]) -> Tuple[str, float]:
         """Call the LLM function."""
@@ -152,15 +209,24 @@ class NLAgent:
         """
         ticker = args.get("ticker")
         company = args.get("company_name")
+        pipeline = args.get("pipeline", "comprehensive")
         
         if not ticker or not company:
             self.logger.warning("Ticker and/or company name missing from extraction")
             return False
-            
-        # Basic ticker format validation (2-5 uppercase letters, possibly with dash)
-        # if not re.match(r'^[A-Z]{2,5}(-[A-Z])?$', ticker):
-        #     self.logger.warning(f"Ticker format invalid: {ticker}")
-        #     return False
+        
+        # Validate pipeline value
+        valid_pipelines = ["comprehensive", "financial-statements", "financial-model", 
+                          "search-news", "screen-news", "news-to-price"]
+        if pipeline not in valid_pipelines:
+            self.logger.warning(f"Invalid pipeline: {pipeline}. Must be one of {valid_pipelines}")
+            return False
+        
+        # Check query requirement for news-related pipelines
+        news_pipelines = ["comprehensive", "search-news", "screen-news", "news-to-price"]
+        if pipeline in news_pipelines and not args.get("query"):
+            self.logger.warning(f"Query is required for pipeline: {pipeline}")
+            return False
             
         self.logger.info("All required arguments are identified from the user request.")
         return True

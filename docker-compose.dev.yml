@@ -1,0 +1,23 @@
+version: '3.8'
+services:
+  api-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fuzanwenn/api-runner:latest
+    container_name: stock-analyst-api-runner-dev
+    ports:
+      - "8080:8080"                 # dev only
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - stockdata:/data
+    env_file:
+      - ./.env.dev
+    environment:
+      # Dev-only: allow http:// for OAuth flows locally
+      - AUTHLIB_INSECURE_TRANSPORT=1
+    restart: unless-stopped
+
+volumes:
+  stockdata:
+    driver: local

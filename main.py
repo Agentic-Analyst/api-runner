@@ -153,6 +153,7 @@ class JobRequest(BaseModel):
     term_growth: Optional[float] = Field(default=None, description="Terminal growth rate (auto-inferred)")
     wacc: Optional[float] = Field(default=None, description="Override WACC (auto-inferred)")
     strategy: Optional[str] = Field(default=None, description="Force specific forecast strategy")
+    query: Optional[str] = Field(default=None, description="Search query for news-related pipelines (e.g., 'AAPL earnings Q3')")
     peers: Optional[str] = Field(default=None, description="Comma-separated peer tickers for comparable analysis (e.g., 'AAPL,MSFT,GOOGL')")
     max_articles: Optional[int] = Field(default=None, description="Maximum articles to scrape (default: 20)")
     min_score: Optional[float] = Field(default=None, description="Minimum relevance score (default: 3.0)")
@@ -174,6 +175,7 @@ class NLRequest(BaseModel):
     term_growth: Optional[float] = Field(default=None, description="Terminal growth rate (auto-inferred)")
     wacc: Optional[float] = Field(default=None, description="Override WACC (auto-inferred)")
     strategy: Optional[str] = Field(default=None, description="Force specific forecast strategy")
+    query: Optional[str] = Field(default=None, description="Search query for news-related pipelines (e.g., 'AAPL earnings Q3')")
     peers: Optional[str] = Field(default=None, description="Comma-separated peer tickers for comparable analysis (e.g., 'AAPL,MSFT,GOOGL')")
     max_articles: Optional[int] = Field(default=None, description="Maximum articles to scrape (default: 20)")
     min_score: Optional[float] = Field(default=None, description="Minimum relevance score (default: 3.0)")
@@ -334,6 +336,7 @@ def process_nl_request(nl_req: NLRequest) -> JobRequest:
             'term_growth': ('term_growth', float),
             'wacc': ('wacc', float),
             'strategy': ('strategy', str),
+            'query': ('query', str),
             'peers': ('peers', str),
             'max_articles': ('max_articles', int),
             'min_score': ('min_score', float),
@@ -507,7 +510,7 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
                          pipeline: Optional[str] = None, model: Optional[str] = None, 
                          years: Optional[int] = None, term_growth: Optional[float] = None,
                          wacc: Optional[float] = None, strategy: Optional[str] = None,
-                         peers: Optional[str] = None,
+                         query: Optional[str] = None, peers: Optional[str] = None,
                          max_articles: Optional[int] = None, min_score: Optional[float] = None, 
                          max_filtered: Optional[int] = None, min_confidence: Optional[float] = None,
                          scaling: Optional[float] = None, adjustment_cap: Optional[float] = None):
@@ -543,6 +546,8 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
             cmd.extend(["--wacc", str(wacc)])
         if strategy:
             cmd.extend(["--strategy", strategy])
+        if query:
+            cmd.extend(["--query", query])
         if peers:
             cmd.extend(["--peers", peers])
         if max_articles is not None:
@@ -721,7 +726,7 @@ async def start_analysis(job: JobRequest, background_tasks: BackgroundTasks):
         job_id, job.ticker, job.company,
         user_email, current_timestamp,
         job.pipeline, job.model, job.years, job.term_growth,
-        job.wacc, job.strategy, job.peers, job.max_articles, job.min_score,
+        job.wacc, job.strategy, job.query, job.peers, job.max_articles, job.min_score,
         job.max_filtered, job.min_confidence, job.scaling, job.adjustment_cap,
     )
 
@@ -775,7 +780,7 @@ async def process_nl_request_endpoint(nl_req: NLRequest, background_tasks: Backg
             job_id, job_request.ticker, job_request.company,
             user_email, current_timestamp,
             job_request.pipeline, job_request.model, job_request.years, job_request.term_growth,
-            job_request.wacc, job_request.strategy, job_request.peers, job_request.max_articles, job_request.min_score,
+            job_request.wacc, job_request.strategy, job_request.query, job_request.peers, job_request.max_articles, job_request.min_score,
             job_request.max_filtered, job_request.min_confidence, job_request.scaling, job_request.adjustment_cap,
         )
 
@@ -808,6 +813,7 @@ async def test_nl_processing(nl_req: NLRequest):
                 "term_growth": job_request.term_growth,
                 "wacc": job_request.wacc,
                 "strategy": job_request.strategy,
+                "query": job_request.query,
                 "peers": job_request.peers,
                 "max_articles": job_request.max_articles,
                 "min_score": job_request.min_score,
