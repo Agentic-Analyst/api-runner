@@ -217,7 +217,7 @@ When starting a new analysis job via `POST /run`, you can customize the analysis
   - `"filter-screen"` - Filter and run LLM analysis
 
 **Advanced Configuration:**
-- `max_articles` (integer): Maximum articles to scrape (default: 20)
+- `max_searched` (integer): Maximum articles to scrape (default: 20)
 - `min_score` (float): Minimum relevance score for filtering (default: 3.0)
 - `max_filtered` (integer): Maximum filtered articles to keep (default: 10)
 - `min_confidence` (float): Minimum confidence for LLM insights (default: 0.5)
@@ -239,7 +239,7 @@ curl -X POST "http://localhost:8080/run" \
     "ticker": "AAPL",
     "company": "Apple Inc",
     "pipeline": "full",
-    "max_articles": 30,
+    "max_searched": 30,
     "min_score": 4.0,
     "max_filtered": 15,
     "min_confidence": 0.7,
@@ -251,7 +251,7 @@ Start a scrape-only job for data collection:
 ```bash
 curl -X POST "http://localhost:8080/run" \
   -H "Content-Type: application/json" \
-  -d '{"ticker": "TSLA", "pipeline": "scrape-only", "max_articles": 50}'
+  -d '{"ticker": "TSLA", "pipeline": "scrape-only", "max_searched": 50}'
 ```
 
 Stream real-time logs:

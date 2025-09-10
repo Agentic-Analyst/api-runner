@@ -12,11 +12,7 @@ Apple/iPhone→AAPL, Microsoft→MSFT, Google/Alphabet→GOOGL, Amazon→AMZN, T
 - **news-to-price**: Search + screen news + adjust price using query
 
 **Query Generation (REQUIRED for search-news, screen-news, news-to-price):**
-Create a short, Chrome-like search query for news. Examples:
-- "Tesla earnings Q3 2024" 
-- "Apple iPhone sales decline"
-- "NVIDIA AI chip demand"
-- "Microsoft cloud revenue growth"
+Create a short, Chrome-like search query for latest news.
 
 **User Request:** {request}
 

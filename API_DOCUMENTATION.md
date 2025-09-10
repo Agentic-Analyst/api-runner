@@ -69,7 +69,7 @@ Starts a new stock analysis job with comprehensive financial modeling options.
   "term_growth": 2.5,
   "wacc": 8.5,
   "strategy": "aggressive",
-  "max_articles": 50,
+  "max_searched": 50,
   "min_score": 0.7,
   "scaling": "moderate",
   "adjustment_cap": 15.0
@@ -98,7 +98,7 @@ Starts a new stock analysis job with comprehensive financial modeling options.
   - `"conservative"`: Conservative assumptions
   - `"moderate"` (default): Balanced assumptions
   - `"aggressive"`: Growth-focused assumptions
-- `max_articles` (optional): Maximum articles to analyze (default: 30)
+- `max_searched` (optional): Maximum articles to analyze (default: 30)
 - `min_score` (optional): Minimum relevance score for articles (default: 0.5)
 - `scaling` (optional): Revenue scaling assumptions
   - `"conservative"`: Low growth scaling
@@ -418,7 +418,7 @@ class StockAnalysisAPI {
     // Add optional financial modeling parameters
     const validOptions = [
       'pipeline', 'model', 'years', 'term_growth', 'wacc', 
-      'strategy', 'max_articles', 'min_score', 'scaling', 'adjustment_cap'
+      'strategy', 'max_searched', 'min_score', 'scaling', 'adjustment_cap'
     ];
     
     validOptions.forEach(key => {
@@ -523,7 +523,7 @@ const jobResponse = await api.startAnalysis('NVDA', 'NVIDIA Corporation', null, 
   term_growth: 2.5,
   wacc: 8.5,
   strategy: 'moderate',
-  max_articles: 40,
+  max_searched: 40,
   min_score: 0.6
 });
 
@@ -644,7 +644,7 @@ The API supports multiple analysis pipelines to meet different use cases:
 | `years` | 5 | 3-10 | Projection period for DCF model |
 | `term_growth` | 2.5% | 1.0-4.0% | Terminal growth rate assumption |
 | `wacc` | 8.0% | 5.0-15.0% | Weighted average cost of capital |
-| `max_articles` | 30 | 10-100 | Maximum articles to analyze |
+| `max_searched` | 30 | 10-100 | Maximum articles to analyze |
 | `min_score` | 0.5 | 0.1-0.9 | Minimum relevance score threshold |
 | `adjustment_cap` | 20.0% | 5.0-50.0% | Maximum price adjustment percentage |
 
