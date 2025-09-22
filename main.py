@@ -39,7 +39,7 @@ from fastapi import Response
 import shlex, time, io, zipfile, hashlib
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware import Middleware
-from agent.nl_agent import NLAgent
+from agents.gateway_agent import GatewayAgent
 from auth_oauth import router as oauth_router  # noqa: E402
 from md_pdf_converter import convert_md_to_pdf
 try:
@@ -296,12 +296,12 @@ def process_nl_request(nl_req: NLRequest) -> JobRequest:
             return None
     
     try:
-        # Use NLAgent to extract parameters from the request
-        nl_agent = NLAgent()
-        extracted_args = nl_agent.process_request(nl_req.request)
-        
-        logger.info(f"NL Agent extracted: {extracted_args}")
-        
+        # Use GatewayAgent to extract parameters from the request
+        gateway_agent = GatewayAgent()
+        extracted_args = gateway_agent.process_request(nl_req.request)
+
+        logger.info(f"Gateway Agent extracted: {extracted_args}")
+
         # Create final parameters by merging extracted and provided values
         # Provided values take priority over extracted ones
         final_args = {}

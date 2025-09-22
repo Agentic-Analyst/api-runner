@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nl_agent.py - Natural Language Agent for Stock Analysis Pipeline
+gateway_agent.py - Natural Language Agent for Stock Analysis Pipeline
 
 This module provides a natural language interface layer that interprets user requests
 and maps them to appropriate main.py commands with proper parameters.
@@ -33,7 +33,7 @@ from llms.gpt import gpt_4o_mini
 
 PROCESS_REQUEST: str = "prompts/process_request.md"
 
-class NLAgent:
+class GatewayAgent:
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
