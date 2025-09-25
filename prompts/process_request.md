@@ -5,14 +5,14 @@ Apple/iPhone→AAPL, Microsoft→MSFT, Google/Alphabet→GOOGL, Amazon→AMZN, T
 
 **Pipeline Selection (REQUIRED - always choose one):**
 - **comprehensive**: Full analysis (financials + model + news + price adjustment) - DEFAULT for general analysis requests
-- **financial-statements**: Only get financial statements
+- **financial-statements**: Only get financial statements (including current market data)
 - **financial-model**: Only build financial model (DCF/comparable)
 - **search-news**: Only search for news articles using query
 - **screen-news**: Only analyze searched news using query  
 - **news-to-price**: Search + screen news + adjust price using query
 
 **Query Generation (REQUIRED for search-news, screen-news, news-to-price):**
-Create a short, Chrome-like search query for latest news.
+Create a short, Chrome-like search query for latest news based on user's intention.
 
 **User Request:** {request}
 
