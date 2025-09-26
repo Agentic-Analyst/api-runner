@@ -30,6 +30,7 @@ from fastapi import Request
 import subprocess
 
 import docker
+import docker.errors
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, PlainTextResponse
@@ -417,7 +418,11 @@ async def monitor_info_log(job_id: str, container):
                     try:
                         container.reload()
                         container_running = (container.status == 'running')
-                    except:
+                    except docker.errors.NotFound:
+                        logger.info(f"Container {container.id[:12]} was removed during log monitoring")
+                        container_running = False
+                    except Exception as e:
+                        logger.warning(f"Error checking container status during log monitoring: {e}")
                         container_running = False
 
                     try:
@@ -452,17 +457,30 @@ async def monitor_info_log(job_id: str, container):
                                         if len(jobs[job_id]["recent_logs"]) > 100:
                                             jobs[job_id]["recent_logs"].pop(0)
 
-                                        if "THE ENTIRE PROGRAM IS COMPLETED" in line:
+                                        if "Stock Analysis Pipeline Session Started" in line:
+                                            jobs[job_id]["progress"] = "Analysis started..."
+                                        elif "STAGE: COMPREHENSIVE PIPELINE" in line:
+                                            jobs[job_id]["progress"] = "Starting comprehensive analysis..."
+                                        elif "STAGE: FINANCIAL SCRAPING" in line:
+                                            jobs[job_id]["progress"] = "Scraping financial data..."
+                                        elif "STAGE: FINANCIAL MODEL GENERATION" in line:
+                                            jobs[job_id]["progress"] = "Generating financial model..."
+                                        elif "STAGE: ARTICLE SCRAPING" in line:
+                                            jobs[job_id]["progress"] = "Scraping new articles..."
+                                        elif "STAGE: ARTICLE FILTERING" in line:
+                                            jobs[job_id]["progress"] = "Filtering news articles..."
+                                        elif "STAGE: ARTICLE SCREENING" in line:
+                                            jobs[job_id]["progress"] = "Screening news articles..."
+                                        elif "STAGE: PRICE ADJUSTMENT" in line:
+                                            jobs[job_id]["progress"] = "Adjusting price based on news..."
+                                        elif "STAGE: PROFESSIONAL REPORT GENERATION" in line:
+                                            jobs[job_id]["progress"] = "Generating professional report..."
+                                        elif "PIPELINE SESSION COMPLETED" in line:
+                                            jobs[job_id]["progress"] = "Finalizing analysis..."
+                                        elif "THE ENTIRE PROGRAM IS COMPLETED" in line:
                                             jobs[job_id]["progress"] = "Analysis completed successfully"
                                             jobs[job_id]["status"] = "completed"
-                                        elif "STAGE: ARTICLE SCRAPING" in line:
-                                            jobs[job_id]["progress"] = "Scraping articles..."
-                                        elif "STAGE: ARTICLE FILTERING" in line:
-                                            jobs[job_id]["progress"] = "Filtering articles..."
-                                        elif "STAGE: ARTICLE SCREENING" in line:
-                                            jobs[job_id]["progress"] = "Running LLM analysis..."
-                                        elif "Pipeline initialized for" in line:
-                                            jobs[job_id]["progress"] = "Pipeline initialized"
+
 
                             last_info_log_size = current_size
 
@@ -585,13 +603,53 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
         try:
             def wait_for_container():
                 return container.wait(timeout=1800)
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                _ = await loop.run_in_executor(executor, wait_for_container)
+            
+            # Monitor for stop requests while container is running
+            stop_check_task = None
+            
+            async def check_stop_request():
+                """Periodically check if job should be stopped"""
+                while True:
+                    await asyncio.sleep(2)  # Check every 2 seconds
+                    current_status = jobs[job_id].get("status")
+                    if current_status in ["stopping", "stopped"]:
+                        logger.info(f"Stop request detected for job {job_id}, killing container")
+                        try:
+                            # Check if container still exists before trying to kill it
+                            try:
+                                container.reload()
+                                if container.status in ['running', 'paused']:
+                                    container.kill()
+                                    logger.info(f"Container {container.id[:12]} killed due to stop request")
+                            except docker.errors.NotFound:
+                                logger.info(f"Container {container.id[:12]} already removed")
+                        except Exception as kill_e:
+                            logger.error(f"Error killing container on stop request: {kill_e}")
+                        return
+            
+            # Start stop monitoring task
+            stop_check_task = asyncio.create_task(check_stop_request())
+            
+            try:
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    await loop.run_in_executor(executor, wait_for_container)
+            finally:
+                if stop_check_task:
+                    stop_check_task.cancel()
 
         except Exception as e:
             logger.error(f"Container wait timeout or error: {e}")
             try:
-                container.kill()
+                # Check if container still exists before trying to kill it
+                try:
+                    container.reload()
+                    if container.status in ['running', 'paused']:
+                        container.kill()
+                except docker.errors.NotFound:
+                    logger.info(f"Container {container.id[:12]} already removed during error handling")
+                except Exception as kill_e:
+                    logger.error(f"Failed to kill container during error handling: {kill_e}")
+                    
                 current_progress = jobs[job_id].get("progress", "").lower()
                 if "llm analysis" in current_progress or "running llm" in current_progress:
                     jobs[job_id]["status"] = "llm_timeout"
@@ -602,32 +660,56 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
                     jobs[job_id]["error"] = f"Analysis timeout: {str(e)}"
                 log_task.cancel()
                 return
-            except Exception as kill_e:
-                logger.error(f"Failed to kill container: {kill_e}")
+            except Exception as cleanup_e:
+                logger.error(f"Error during cleanup: {cleanup_e}")
 
+        # Cancel log monitoring task
         log_task.cancel()
-        container.reload()
-        exit_code = container.attrs['State']['ExitCode']
+        
+        # Try to get container exit code, but handle case where container was removed
+        exit_code = None
+        try:
+            container.reload()
+            exit_code = container.attrs['State']['ExitCode']
+        except docker.errors.NotFound:
+            logger.info(f"Container {container.id[:12]} was removed before exit code check")
+        except Exception as e:
+            logger.warning(f"Could not get container exit code: {e}")
 
-        if exit_code == 0:
+        # Check if job was stopped by user before checking exit code
+        current_status = jobs[job_id].get("status")
+        if current_status in ["stopping", "stopped"]:
+            if current_status == "stopping":
+                jobs[job_id]["status"] = "stopped"
+                jobs[job_id]["progress"] = "Analysis stopped by user"
+            jobs[job_id]["completed_at"] = datetime.now().isoformat()
+            logger.info(f"✅ Analysis job {job_id} stopped by user request")
+        elif exit_code == 0:
             if jobs[job_id]["status"] != "completed":
                 jobs[job_id]["status"] = "completed"
                 jobs[job_id]["progress"] = "Analysis completed successfully"
             jobs[job_id]["completed_at"] = datetime.now().isoformat()
             logger.info(f"✅ Analysis job {job_id} completed successfully")
-        else:
-            current_status = jobs[job_id].get("status")
+        elif exit_code is not None and exit_code != 0:
             if current_status == "llm_timeout":
-                logger.warning(f"⚠️ Analysis job {job_id} timed out during LLM analysis")
+                jobs[job_id]["progress"] = "LLM analysis timed out - retrying may help"
             else:
                 jobs[job_id]["status"] = "failed"
-                jobs[job_id]["error"] = f"Container exited with code {exit_code}"
+                jobs[job_id]["error"] = f"Analysis failed with exit code {exit_code}"
                 logger.error(f"❌ Analysis job {job_id} failed with exit code {exit_code}")
 
-        try:
-            container.remove()
-        except Exception as e:
-            logger.warning(f"Failed to remove container: {e}")
+        # Only try to remove container if job wasn't stopped by user (stop endpoint handles removal)
+        current_final_status = jobs[job_id].get("status")
+        if current_final_status not in ["stopped"]:
+            try:
+                container.remove()
+                logger.info(f"Container {container.id[:12]} removed after job completion")
+            except docker.errors.NotFound:
+                logger.info(f"Container {container.id[:12]} already removed")
+            except Exception as e:
+                logger.warning(f"Failed to remove container: {e}")
+        else:
+            logger.info(f"Container removal skipped - job was stopped by user")
 
     except Exception as e:
         logger.error(f"❌ Error in analysis job {job_id}: {e}")
@@ -790,47 +872,6 @@ async def process_nl_request_endpoint(nl_req: NLRequest, background_tasks: Backg
         logger.error(f"Error in NL request processing: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to process request: {str(e)}")
 
-# ------------- Test NL Processing (debug endpoint) -------------
-@app.post("/nl/test")
-async def test_nl_processing(nl_req: NLRequest):
-    """
-    Test endpoint to see what parameters the NL agent would extract from a request.
-    This is for debugging and doesn't start an actual job.
-    """
-    try:
-        # Process the natural language request
-        job_request = process_nl_request(nl_req)
-        
-        return {
-            "original_request": nl_req.request,
-            "extracted_parameters": {
-                "ticker": job_request.ticker,
-                "company": job_request.company,
-                "email": job_request.email,
-                "pipeline": job_request.pipeline,
-                "model": job_request.model,
-                "years": job_request.years,
-                "term_growth": job_request.term_growth,
-                "wacc": job_request.wacc,
-                "strategy": job_request.strategy,
-                "query": job_request.query,
-                "peers": job_request.peers,
-                "max_searched": job_request.max_searched,
-                "min_score": job_request.min_score,
-                "max_filtered": job_request.max_filtered,
-                "min_confidence": job_request.min_confidence,
-                "scaling": job_request.scaling,
-                "adjustment_cap": job_request.adjustment_cap,
-            },
-            "provided_overrides": {
-                k: v for k, v in nl_req.dict().items() 
-                if k != "request" and v is not None
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in NL test processing: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to process request: {str(e)}")
 
 # ------------- Read job(s) -------------
 @app.get("/jobs/{job_id}", response_model=JobStatus)
@@ -842,6 +883,114 @@ async def get_job_status(job_id: str):
 @app.get("/jobs")
 async def list_jobs():
     return {"jobs": list(jobs.values())}
+
+@app.get("/jobs/stoppable")
+async def list_stoppable_jobs():
+    """
+    List all jobs that can be stopped (status: pending or running)
+    """
+    stoppable_jobs = [
+        job for job in jobs.values() 
+        if job.get("status") in ["pending", "running"]
+    ]
+    return {
+        "stoppable_jobs": stoppable_jobs,
+        "count": len(stoppable_jobs)
+    }
+
+# ------------- Stop job -------------
+@app.post("/jobs/{job_id}/stop", response_model=JobResponse)
+async def stop_job(job_id: str):
+    """
+    Stop a running analysis job gracefully.
+    
+    This endpoint will:
+    1. Change job status to 'stopping'
+    2. Send SIGTERM to the Docker container (graceful stop)
+    3. Wait up to 10 seconds for graceful shutdown
+    4. Clean up the container
+    5. Update job status to 'stopped'
+    
+    Only jobs with status 'pending' or 'running' can be stopped.
+    """
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    current_status = job.get("status")
+    
+    # Check if job can be stopped
+    if current_status not in ["pending", "running"]:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Cannot stop job with status '{current_status}'. Only pending or running jobs can be stopped."
+        )
+    
+    container_id = job.get("container_id")
+    ticker = job.get("ticker", "Unknown")
+    
+    try:
+        # Update job status immediately
+        jobs[job_id]["status"] = "stopping"
+        jobs[job_id]["progress"] = "Stopping analysis..."
+        jobs[job_id]["latest_log"] = "Job stop requested by user"
+        jobs[job_id]["last_activity"] = datetime.now().isoformat()
+        
+        # If there's a container, stop it gracefully
+        if container_id and docker_client:
+            try:
+                container = docker_client.containers.get(container_id)
+                container.reload()
+                
+                if container.status == "running":
+                    logger.info(f"Stopping container {container_id} for job {job_id} ({ticker})")
+                    
+                    # Try graceful stop first (SIGTERM)
+                    container.stop(timeout=10)
+                    logger.info(f"Container {container_id} stopped gracefully")
+                    
+                    # Clean up container
+                    try:
+                        container.remove()
+                        logger.info(f"Container {container_id} removed")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove container {container_id}: {e}")
+                else:
+                    logger.info(f"Container {container_id} was not running (status: {container.status})")
+                    
+            except docker.errors.NotFound:
+                logger.info(f"Container {container_id} not found, may have already been removed")
+            except Exception as e:
+                logger.error(f"Error stopping container {container_id}: {e}")
+                # Continue with job cleanup even if container stop fails
+        
+        # Update final job status
+        jobs[job_id]["status"] = "stopped"
+        jobs[job_id]["progress"] = "Analysis stopped by user"
+        jobs[job_id]["completed_at"] = datetime.now().isoformat()
+        jobs[job_id]["error"] = None  # Clear any previous errors
+        
+        logger.info(f"✅ Successfully stopped job {job_id} ({ticker})")
+        
+        return {
+            "job_id": job_id,
+            "ticker": ticker,
+            "status": "stopped",
+            "message": "Analysis job stopped successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error stopping job {job_id}: {e}")
+        
+        # Update job with error status
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"] = f"Failed to stop job: {str(e)}"
+        jobs[job_id]["completed_at"] = datetime.now().isoformat()
+        
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to stop job: {str(e)}"
+        )
 
 # ------------- Stream logs (SSE) -------------
 @app.get("/jobs/{job_id}/logs/stream")
@@ -911,6 +1060,9 @@ async def get_job_logs_stream(job_id: str):
                     if content_res.exit_code == 0 and content_res.output:
                         return current_size, content_res.output
                 return current_size, b""
+            except docker.errors.NotFound:
+                logger.warning(f"Container {container_id} was removed during SSE log reading")
+                return 0, b""
             except Exception as e:
                 logger.warning(f"Error reading from container {container_id}: {e}")
                 return 0, b""
@@ -989,6 +1141,12 @@ async def get_job_logs_stream(job_id: str):
 
         try:
             while True:
+                # Check for stopped job at the beginning of each iteration
+                current_status = job.get("status")
+                if current_status == "stopped":
+                    yield sse("completed", "Analysis stopped by user")
+                    break
+                
                 something_new = False
                 async for evt in drain_once():
                     something_new = True
@@ -1011,13 +1169,26 @@ async def get_job_logs_stream(job_id: str):
                         if not have_seen_any_data:
                             yield sse("status", "Analysis running, waiting for log output..." if container else "Waiting for analysis to start...")
 
-                job_done = job.get("status") in {"completed", "failed", "stopped"}
+                job_status = job.get("status")
+                job_done = job_status in {"completed", "failed", "stopped", "stopping"}
+                
+                # Immediate exit for stopped jobs to prevent continued streaming
+                if job_status == "stopped":
+                    yield sse("completed", "Analysis stopped by user")
+                    await asyncio.sleep(0.25)
+                    break
+                
                 container_running = False
                 if container:
                     try:
                         container.reload()
                         container_running = (container.status == "running")
-                    except Exception:
+                    except docker.errors.NotFound:
+                        logger.info(f"Container {container_id} was removed during SSE streaming")
+                        container_running = False
+                        container = None
+                    except Exception as e:
+                        logger.warning(f"Error checking container status during SSE: {e}")
                         container_running = False
                         container = None
 
@@ -1071,7 +1242,8 @@ async def get_job_logs(job_id: str):
 async def download_file(job_id: str, filename: str):
     """
     Download a specific top-level file from job results.
-    Supported: info.log, screening_report.md, screening_data.json, price_adjustment_explanation_latest.md
+    Supported: info.log, screening_report.md, screening_data.json, price_adjustment_explanation_latest.md, 
+               technical_analysis_latest.md, professional_analyst_report_latest.md
     """
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1086,12 +1258,16 @@ async def download_file(job_id: str, filename: str):
         "screening_report.md": "text/markdown",
         "screening_data.json": "application/json",
         "price_adjustment_explanation_latest.md": "text/markdown",
+        "technical_analysis_latest.md": "text/markdown",
+        "professional_analyst_report_latest.md": "text/markdown",
     }
     if filename not in supported:
         raise HTTPException(status_code=400, detail=f"Unsupported filename '{filename}'. Supported: {list(supported.keys())}")
 
     try:
-        if filename.startswith("price_adjustment_explanation"):
+        if filename.startswith("price_adjustment_explanation") or \
+           filename.startswith("technical_analysis") or \
+           filename.startswith("professional_analyst_report"):
             path = f"{base}/reports/{filename}"
         elif filename.startswith("screening"):
             path = f"{base}/screened/{filename}"
@@ -1576,7 +1752,6 @@ async def download_financial_model_comparable(job_id: str):
         },
     )
 
-
 # ------------- Download filtered_report.md -------------
 @app.get("/jobs/{job_id}/download/filtered-report")
 async def download_filtered_report(job_id: str):
@@ -1608,9 +1783,12 @@ async def download_filtered_report(job_id: str):
         logger.error(f"Error downloading filtered report for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not read filtered report file: {str(e)}")
 
-# ------------- Download price_adjustment_explanation_latest.md -------------
-@app.get("/jobs/{job_id}/download/price-adjustment-explanation")
-async def download_price_adjustment_explanation(job_id: str):
+# ------------- Download technical_analysis_latest.md -------------
+@app.get("/jobs/{job_id}/download/technical-analysis")
+async def download_technical_analysis(job_id: str):
+    """
+    Download technical analysis report as PDF
+    """
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     if not docker_client:
@@ -1623,23 +1801,61 @@ async def download_price_adjustment_explanation(job_id: str):
     try:
         result = docker_client.containers.run(
             "alpine:latest",
-            command=f"sh -c 'cat {shlex.quote(base)}/reports/price_adjustment_explanation_latest.md'",
+            command=f"sh -c 'cat {shlex.quote(base)}/reports/technical_analysis_latest.md'",
             volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
             remove=True,
             detach=False
         )
         if not result:
-            raise HTTPException(status_code=404, detail="Price adjustment explanation not found")
+            raise HTTPException(status_code=404, detail="Technical analysis report not found")
+        
         md_content = result.decode('utf-8')
         pdf_bytes = convert_md_to_pdf(md_content, ticker)
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_price_adjustment_explanation_latest.pdf"'}
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_technical_analysis_latest.pdf"'}
         return StreamingResponse(BytesIO(pdf_bytes), media_type='application/pdf', headers=headers)
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error downloading price adjustment explanation for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not read price adjustment explanation file: {str(e)}")
+        logger.error(f"Error downloading technical analysis for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read technical analysis file: {str(e)}")
+
+# ------------- Download professional_analyst_report_latest.md -------------
+@app.get("/jobs/{job_id}/download/professional-analyst-report")
+async def download_professional_analyst_report(job_id: str):
+    """
+    Download professional analyst report as PDF
+    """
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not docker_client:
+        raise HTTPException(status_code=503, detail="Docker not available")
+
+    job = jobs[job_id]
+    base = job_root(job)
+    ticker = (job.get('ticker') or '').upper()
+
+    try:
+        result = docker_client.containers.run(
+            "alpine:latest",
+            command=f"sh -c 'cat {shlex.quote(base)}/reports/professional_analyst_report_latest.md'",
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
+            remove=True,
+            detach=False
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Professional analyst report not found")
+        
+        md_content = result.decode('utf-8')
+        pdf_bytes = convert_md_to_pdf(md_content, ticker)
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_professional_analyst_report_latest.pdf"'}
+        return StreamingResponse(BytesIO(pdf_bytes), media_type='application/pdf', headers=headers)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading professional analyst report for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read professional analyst report file: {str(e)}")
 
 # ------------- List job files -------------
 @app.get("/jobs/{job_id}/files")
@@ -1665,6 +1881,8 @@ async def list_job_files(job_id: str):
             "financial_model_comparable": False,
             "filtered_report": False,
             "price_adjustment_explanation": False,
+            "technical_analysis": False,
+            "professional_analyst_report": False,
         }
 
         # info.log
@@ -1796,6 +2014,32 @@ async def list_job_files(job_id: str):
         except:
             pass
 
+        # reports/technical_analysis_latest.md
+        try:
+            docker_client.containers.run(
+                "alpine:latest",
+                command=f"test -f {shlex.quote(base)}/reports/technical_analysis_latest.md",
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
+                remove=True,
+                detach=False
+            )
+            files["technical_analysis"] = True
+        except:
+            pass
+
+        # reports/professional_analyst_report_latest.md
+        try:
+            docker_client.containers.run(
+                "alpine:latest",
+                command=f"test -f {shlex.quote(base)}/reports/professional_analyst_report_latest.md",
+                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
+                remove=True,
+                detach=False
+            )
+            files["professional_analyst_report"] = True
+        except:
+            pass
+
         # Check for peer financials
         try:
             peer_base = str(Path(base).parent)  # Go up one level
@@ -1834,34 +2078,12 @@ async def get_detailed_job_status(job_id: str):
     except:
         files = {}
 
-    progress_percentage = 0
-    if job.get("status") == "completed":
-        progress_percentage = 100
-    elif job.get("status") == "failed":
-        progress_percentage = 0
-    elif job.get("status") == "llm_timeout":
-        progress_percentage = 75
-    else:
-        progress_map = {
-            "Scraping articles": 25,
-            "Filtering articles": 50,
-            "Running LLM analysis": 75,
-            "Generating reports": 90,
-            "Pipeline session completed": 100
-        }
-        current_progress = job.get("progress", "")
-        for stage, percentage in progress_map.items():
-            if stage.lower() in current_progress.lower():
-                progress_percentage = percentage
-                break
-
     return {
         "job_id": job_id,
         "ticker": job.get("ticker"),
         "company": job.get("company"),
         "status": job.get("status"),
         "progress": job.get("progress"),
-        "progress_percentage": progress_percentage,
         "created_at": job.get("created_at"),
         "completed_at": job.get("completed_at"),
         "duration": job.get("duration"),
