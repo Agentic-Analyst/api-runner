@@ -43,6 +43,16 @@ from starlette.middleware import Middleware
 from agents.gateway_agent import GatewayAgent
 from auth_oauth import router as oauth_router  # noqa: E402
 from md_pdf_converter import convert_md_to_pdf
+from database import init_mongodb, close_mongodb, check_mongodb_health, user_router, portfolio_router
+
+# Real-time stock price system
+from realtime import (
+    PriceManager, 
+    stock_router,
+    PriceFetchConfig
+)
+from realtime.stock_api import init_realtime_api
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -61,6 +71,10 @@ FINAL_DRAIN_STABLE_CYCLES = 3  # how many consecutive polls with no growth befor
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Global real-time services
+price_manager: Optional[PriceManager] = None
+websocket_manager = None
+
 # --- Env / App init ---
 def _csv_env(name: str, default: str = "") -> List[str]:
     raw = os.getenv(name, default)
@@ -71,7 +85,7 @@ def _csv_env(name: str, default: str = "") -> List[str]:
 FRONTEND_ORIGINS = _csv_env("FRONTEND_ORIGIN")
 ROOT_PATH = os.getenv("ROOT_PATH")
 SESSION_SECRET = os.getenv("SESSION_SECRET")
-SESSION_HTTPS_ONLY = os.getenv("SESSION_HTTPS_ONLY").lower() == "true"
+SESSION_HTTPS_ONLY = os.getenv("SESSION_HTTPS_ONLY", "false").lower() == "true"
 SESSION_STORE_COOKIE = os.getenv("SESSION_STORE_COOKIE")
 
 # SameSite configuration
@@ -113,6 +127,9 @@ app = FastAPI(
 # Routers
 app.include_router(oauth_router)
 app.include_router(code_router)
+app.include_router(user_router)
+app.include_router(portfolio_router)
+app.include_router(stock_router)
 
 # Health endpoint (useful for container probes)
 @app.get("/healthz")
@@ -727,6 +744,8 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
 # ------------- Startup / health -------------
 @app.on_event("startup")
 async def startup_event():
+    global price_manager, websocket_manager
+    
     logger.info("🚀 Starting Stock Analyst API Runner...")
     docker_ready = init_docker_client()
     if not docker_ready:
@@ -743,7 +762,64 @@ async def startup_event():
     else:
         logger.info("✅ OPENAI_API_KEY configured")
 
+    # Initialize MongoDB
+    mongodb_ready = await init_mongodb()
+    if mongodb_ready:
+        logger.info("✅ MongoDB connected successfully")
+    else:
+        logger.warning("⚠️ MongoDB not available - user features may be limited")
+
+    # Initialize real-time stock price system
+    try:
+        logger.info("🚀 Starting real-time stock price system...")
+        
+        # Create price manager with configuration
+        price_config = PriceFetchConfig(
+            fetch_interval=10,  # 10 seconds as requested
+            max_symbols_per_request=50,
+            retry_attempts=3,
+            timeout=30
+        )
+        price_manager = PriceManager(price_config)
+        
+        # Start price manager
+        await price_manager.start()
+        
+        # Initialize FastAPI WebSocket manager (integrated with main FastAPI app)
+        from realtime.fastapi_websocket import init_fastapi_websocket_manager
+        websocket_manager = init_fastapi_websocket_manager(price_manager)
+        
+        # Initialize API endpoints with services
+        init_realtime_api(price_manager, websocket_manager)
+        
+        logger.info("✅ Real-time stock price system started")
+        logger.info("📡 WebSocket endpoint available at /api/realtime/ws")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to start real-time system: {e}")
+        logger.warning("⚠️ Real-time features will be unavailable")
+
     logger.info("✅ API Runner started successfully")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global price_manager, websocket_manager
+    
+    logger.info("🔌 Shutting down API Runner...")
+    
+    # Shutdown real-time services
+    try:
+        if price_manager:
+            logger.info("🛑 Stopping real-time stock price system...")
+            await price_manager.stop()
+            
+        logger.info("✅ Real-time services stopped")
+    except Exception as e:
+        logger.error(f"❌ Error stopping real-time services: {e}")
+    
+    # Shutdown MongoDB
+    await close_mongodb()
+    logger.info("✅ API Runner shutdown complete")
 
 @app.get("/")
 async def root():
@@ -757,9 +833,20 @@ async def root():
 @app.get("/health")
 async def health_check():
     docker_status = "connected" if docker_client else "disconnected"
+    mongodb_status = "connected" if await check_mongodb_health() else "disconnected"
+    
+    # Check real-time service status
+    realtime_status = "stopped"
+    websocket_status = "integrated"  # WebSocket is now integrated with FastAPI
+    if price_manager and price_manager.is_running:
+        realtime_status = "running"
+    
     return {
         "status": "healthy",
         "docker": docker_status,
+        "mongodb": mongodb_status,
+        "realtime_prices": realtime_status,
+        "websocket_server": websocket_status,
         "backend_image": BACKEND_IMAGE,
         "data_volume": DATA_VOLUME,
         "api_keys_configured": {

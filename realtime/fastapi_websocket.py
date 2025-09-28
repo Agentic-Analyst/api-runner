@@ -1,0 +1,380 @@
+"""
+WebSocket endpoints for FastAPI integration.
+
+Provides WebSocket endpoints within the FastAPI application instead of a separate WebSocket server.
+This allows proper integration with reverse proxy setups.
+"""
+
+import asyncio
+import json
+import logging
+from typing import Dict, Set, List, Optional
+from datetime import datetime
+from fastapi import WebSocket, WebSocketDisconnect, APIRouter
+from fastapi.websockets import WebSocketState
+
+from .models import StockSubscription, PriceUpdate, WebSocketMessage, ErrorResponse
+from .price_fetcher import PriceManager
+
+logger = logging.getLogger(__name__)
+
+class FastAPIWebSocketConnection:
+    """Represents a single FastAPI WebSocket connection with subscription management."""
+    
+    def __init__(self, websocket: WebSocket, connection_id: str):
+        self.websocket = websocket
+        self.connection_id = connection_id
+        self.subscribed_symbols: Set[str] = set()
+        self.user_id: Optional[str] = None
+        self.connected_at = datetime.now()
+        self.last_ping = datetime.now()
+    
+    async def send_message(self, message: dict):
+        """Send JSON message to client."""
+        try:
+            if self.websocket.client_state == WebSocketState.CONNECTED:
+                await self.websocket.send_text(json.dumps(message, default=str))
+        except Exception as e:
+            logger.debug(f"Connection {self.connection_id} closed during send: {e}")
+            raise
+    
+    async def send_price_update(self, update: PriceUpdate):
+        """Send price update to client."""
+        message = {
+            "type": "price_update",
+            "data": update.dict(),
+            "timestamp": datetime.now().isoformat()
+        }
+        await self.send_message(message)
+    
+    async def send_error(self, error: str, message: str, symbol: str = None):
+        """Send error message to client."""
+        error_msg = {
+            "type": "error",
+            "data": {
+                "error": error,
+                "message": message,
+                "symbol": symbol,
+                "timestamp": datetime.now().isoformat()
+            }
+        }
+        await self.send_message(error_msg)
+    
+    def is_subscribed_to(self, symbol: str) -> bool:
+        """Check if connection is subscribed to a symbol."""
+        return symbol.upper() in self.subscribed_symbols
+
+class FastAPIWebSocketManager:
+    """Manages FastAPI WebSocket connections and integrates with PriceManager."""
+    
+    def __init__(self, price_manager: PriceManager):
+        self.price_manager = price_manager
+        self.connections: Dict[str, FastAPIWebSocketConnection] = {}
+        self.symbol_subscribers: Dict[str, Set[str]] = {}  # symbol -> connection_ids
+        self._connection_counter = 0
+    
+    def _generate_connection_id(self) -> str:
+        """Generate unique connection ID."""
+        self._connection_counter += 1
+        return f"ws_{self._connection_counter}_{int(datetime.now().timestamp())}"
+    
+    async def handle_websocket_connection(self, websocket: WebSocket):
+        """Handle new FastAPI WebSocket connection."""
+        await websocket.accept()
+        
+        connection_id = self._generate_connection_id()
+        connection = FastAPIWebSocketConnection(websocket, connection_id)
+        self.connections[connection_id] = connection
+        
+        logger.info(f"🔌 New WebSocket connection: {connection_id} (total: {len(self.connections)})")
+        
+        try:
+            # Send welcome message
+            await connection.send_message({
+                "type": "connected",
+                "data": {
+                    "connection_id": connection_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "message": "Connected to real-time stock price feed"
+                }
+            })
+            
+            # Handle incoming messages
+            while True:
+                try:
+                    message = await websocket.receive_text()
+                    await self._handle_message(connection, message)
+                except WebSocketDisconnect:
+                    logger.info(f"🔌 WebSocket {connection_id} disconnected")
+                    break
+                except Exception as e:
+                    logger.error(f"❌ Error handling message from {connection_id}: {e}")
+                    await connection.send_error("internal_error", "Internal server error")
+                
+        except Exception as e:
+            logger.error(f"❌ Unexpected error for WebSocket {connection_id}: {e}")
+        finally:
+            await self._cleanup_connection(connection_id)
+    
+    async def _handle_message(self, connection: FastAPIWebSocketConnection, message: str):
+        """Handle incoming WebSocket message from client."""
+        try:
+            data = json.loads(message)
+            message_type = data.get('type', '').lower()
+            
+            if message_type == 'subscribe':
+                await self._handle_subscription(connection, data)
+            elif message_type == 'unsubscribe':
+                await self._handle_unsubscription(connection, data)
+            elif message_type == 'ping':
+                await self._handle_ping(connection)
+            elif message_type == 'get_price':
+                await self._handle_get_price(connection, data)
+            else:
+                await connection.send_error(
+                    "invalid_message_type",
+                    f"Unknown message type: {message_type}"
+                )
+                
+        except json.JSONDecodeError:
+            await connection.send_error(
+                "invalid_json",
+                "Message must be valid JSON"
+            )
+        except Exception as e:
+            logger.error(f"Error handling message from {connection.connection_id}: {e}")
+            await connection.send_error(
+                "internal_error",
+                "Internal server error"
+            )
+    
+    async def _handle_subscription(self, connection: FastAPIWebSocketConnection, data: dict):
+        """Handle subscription request."""
+        try:
+            symbols = data.get('symbols', [])
+            user_id = data.get('user_id')
+            
+            if not symbols:
+                await connection.send_error(
+                    "invalid_subscription",
+                    "Must provide symbols array"
+                )
+                return
+            
+            # Update connection user_id if provided
+            if user_id:
+                connection.user_id = user_id
+            
+            # Subscribe to each symbol
+            subscribed = []
+            for symbol in symbols:
+                symbol = symbol.upper()
+                
+                # Add to connection subscriptions
+                connection.subscribed_symbols.add(symbol)
+                
+                # Add to global symbol subscribers
+                if symbol not in self.symbol_subscribers:
+                    self.symbol_subscribers[symbol] = set()
+                self.symbol_subscribers[symbol].add(connection.connection_id)
+                
+                # Subscribe to price manager if first subscriber
+                if len(self.symbol_subscribers[symbol]) == 1:
+                    self.price_manager.subscribe_symbol(
+                        symbol, 
+                        lambda update, s=symbol: asyncio.create_task(self._broadcast_price_update(s, update))
+                    )
+                
+                subscribed.append(symbol)
+            
+            # Send confirmation
+            await connection.send_message({
+                "type": "subscribed",
+                "data": {
+                    "symbols": subscribed,
+                    "total_subscriptions": len(connection.subscribed_symbols),
+                    "timestamp": datetime.now().isoformat()
+                }
+            })
+            
+            logger.info(f"📊 WebSocket {connection.connection_id} subscribed to: {subscribed}")
+            
+            # Send current prices for subscribed symbols
+            await self._send_current_prices(connection, subscribed)
+            
+        except Exception as e:
+            logger.error(f"Error in subscription for {connection.connection_id}: {e}")
+            await connection.send_error("subscription_error", str(e))
+    
+    async def _handle_unsubscription(self, connection: FastAPIWebSocketConnection, data: dict):
+        """Handle unsubscription request."""
+        try:
+            symbols = data.get('symbols', [])
+            
+            if not symbols:
+                # Unsubscribe from all
+                symbols = list(connection.subscribed_symbols)
+            
+            unsubscribed = []
+            for symbol in symbols:
+                symbol = symbol.upper()
+                
+                if symbol in connection.subscribed_symbols:
+                    # Remove from connection subscriptions
+                    connection.subscribed_symbols.discard(symbol)
+                    
+                    # Remove from global symbol subscribers
+                    if symbol in self.symbol_subscribers:
+                        self.symbol_subscribers[symbol].discard(connection.connection_id)
+                        
+                        # Unsubscribe from price manager if no more subscribers
+                        if not self.symbol_subscribers[symbol]:
+                            self.price_manager.unsubscribe_symbol(symbol)
+                            del self.symbol_subscribers[symbol]
+                    
+                    unsubscribed.append(symbol)
+            
+            # Send confirmation
+            await connection.send_message({
+                "type": "unsubscribed",
+                "data": {
+                    "symbols": unsubscribed,
+                    "remaining_subscriptions": len(connection.subscribed_symbols),
+                    "timestamp": datetime.now().isoformat()
+                }
+            })
+            
+            logger.info(f"📊 WebSocket {connection.connection_id} unsubscribed from: {unsubscribed}")
+            
+        except Exception as e:
+            logger.error(f"Error in unsubscription for {connection.connection_id}: {e}")
+            await connection.send_error("unsubscription_error", str(e))
+    
+    async def _handle_ping(self, connection: FastAPIWebSocketConnection):
+        """Handle ping message."""
+        connection.last_ping = datetime.now()
+        await connection.send_message({
+            "type": "pong",
+            "data": {
+                "timestamp": datetime.now().isoformat()
+            }
+        })
+    
+    async def _handle_get_price(self, connection: FastAPIWebSocketConnection, data: dict):
+        """Handle immediate price request."""
+        try:
+            symbol = data.get('symbol', '').upper()
+            
+            if not symbol:
+                await connection.send_error("invalid_request", "Must provide symbol")
+                return
+            
+            price = await self.price_manager.get_current_price(symbol, force_refresh=True)
+            
+            if price:
+                await connection.send_message({
+                    "type": "current_price",
+                    "data": {
+                        "symbol": symbol,
+                        "price": price.dict(),
+                        "timestamp": datetime.now().isoformat()
+                    }
+                })
+            else:
+                await connection.send_error("price_not_found", f"Could not fetch price for {symbol}", symbol)
+                
+        except Exception as e:
+            logger.error(f"Error fetching price for {connection.connection_id}: {e}")
+            await connection.send_error("fetch_error", str(e))
+    
+    async def _send_current_prices(self, connection: FastAPIWebSocketConnection, symbols: List[str]):
+        """Send current prices for symbols to a connection."""
+        try:
+            prices = await self.price_manager.get_multiple_prices(symbols)
+            
+            for symbol, price in prices.items():
+                if price:
+                    await connection.send_message({
+                        "type": "current_price",
+                        "data": {
+                            "symbol": symbol,
+                            "price": price.dict(),
+                            "timestamp": datetime.now().isoformat()
+                        }
+                    })
+                else:
+                    await connection.send_error(
+                        "price_unavailable", 
+                        f"Price not available for {symbol}", 
+                        symbol
+                    )
+        except Exception as e:
+            logger.error(f"Error sending current prices: {e}")
+    
+    async def _broadcast_price_update(self, symbol: str, update: PriceUpdate):
+        """Broadcast price update to all subscribers of a symbol."""
+        if symbol not in self.symbol_subscribers:
+            return
+        
+        # Get all connection IDs subscribed to this symbol
+        connection_ids = list(self.symbol_subscribers[symbol])
+        
+        # Send update to each connection
+        for connection_id in connection_ids:
+            if connection_id in self.connections:
+                connection = self.connections[connection_id]
+                try:
+                    await connection.send_price_update(update)
+                except Exception as e:
+                    logger.error(f"Error sending price update to {connection_id}: {e}")
+    
+    async def _cleanup_connection(self, connection_id: str):
+        """Clean up connection and unsubscribe from all symbols."""
+        if connection_id not in self.connections:
+            return
+        
+        connection = self.connections[connection_id]
+        
+        # Unsubscribe from all symbols
+        for symbol in list(connection.subscribed_symbols):
+            if symbol in self.symbol_subscribers:
+                self.symbol_subscribers[symbol].discard(connection_id)
+                
+                # Unsubscribe from price manager if no more subscribers
+                if not self.symbol_subscribers[symbol]:
+                    self.price_manager.unsubscribe_symbol(symbol)
+                    del self.symbol_subscribers[symbol]
+        
+        # Remove connection
+        del self.connections[connection_id]
+        
+        logger.info(f"🧹 Cleaned up WebSocket connection {connection_id} (remaining: {len(self.connections)})")
+    
+    def get_stats(self) -> dict:
+        """Get WebSocket server statistics."""
+        return {
+            "total_connections": len(self.connections),
+            "subscribed_symbols": len(self.symbol_subscribers),
+            "connections": [
+                {
+                    "id": conn_id,
+                    "subscriptions": len(conn.subscribed_symbols),
+                    "user_id": conn.user_id,
+                    "connected_at": conn.connected_at.isoformat()
+                }
+                for conn_id, conn in self.connections.items()
+            ]
+        }
+
+# Global WebSocket manager instance
+fastapi_websocket_manager: Optional[FastAPIWebSocketManager] = None
+
+def init_fastapi_websocket_manager(price_manager: PriceManager) -> FastAPIWebSocketManager:
+    """Initialize the global FastAPI WebSocket manager."""
+    global fastapi_websocket_manager
+    fastapi_websocket_manager = FastAPIWebSocketManager(price_manager)
+    return fastapi_websocket_manager
+
+def get_fastapi_websocket_manager() -> FastAPIWebSocketManager:
+    """Get the global FastAPI WebSocket manager."""
+    return fastapi_websocket_manager
