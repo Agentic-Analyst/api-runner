@@ -53,11 +53,8 @@ from realtime import (
 )
 from realtime.stock_api import init_realtime_api
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from dotenv import load_dotenv
+load_dotenv()
 
 # Email-code login router
 from auth_code_login import router as code_router  # <— ensure this file is present
@@ -145,6 +142,7 @@ BACKEND_IMAGE = os.getenv("BACKEND_IMAGE", "stock-analyst:latest")
 DATA_VOLUME = os.getenv("DATA_VOLUME", "stockdata")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # --------- Utilities for new layout ---------
 def job_root(job: Dict) -> str:
@@ -165,6 +163,7 @@ class JobRequest(BaseModel):
     ticker: str = Field(..., description="Stock ticker symbol (e.g., NVDA)")
     company: str = Field(..., description="Company name (e.g., 'NVIDIA')")
     email: str = Field(..., description="User email for data organization")
+    llm: Optional[str] = Field(default="gpt-4o-mini", description="LLM model to use for analysis")
     pipeline: Optional[str] = Field(default=None, description="Pipeline to run (default: comprehensive)")
     model: Optional[str] = Field(default=None, description="Financial model type (default: comprehensive)")
     years: Optional[int] = Field(default=None, description="Projection years (default: 5)")
@@ -187,6 +186,7 @@ class NLRequest(BaseModel):
     ticker: Optional[str] = Field(default=None, description="Stock ticker symbol (e.g., NVDA)")
     company: Optional[str] = Field(default=None, description="Company name (e.g., 'NVIDIA')")
     email: str = Field(..., description="User email for data organization")
+    llm: Optional[str] = Field(default="gpt-4o-mini", description="LLM model to use for analysis")
     pipeline: Optional[str] = Field(default=None, description="Pipeline to run (default: comprehensive)")
     model: Optional[str] = Field(default=None, description="Financial model type (default: comprehensive)")
     years: Optional[int] = Field(default=None, description="Projection years (default: 5)")
@@ -348,6 +348,7 @@ def process_nl_request(nl_req: NLRequest) -> JobRequest:
         # For other parameters, prefer provided, then extracted, then None (use defaults)
         # Define expected types for validation
         param_mapping = {
+            'llm': ('llm', str),
             'pipeline': ('pipeline', str),
             'model': ('model', str), 
             'years': ('years', int),
@@ -542,7 +543,7 @@ async def monitor_info_log(job_id: str, container):
 # ------------- Job runner -------------
 async def run_analysis_job(job_id: str, ticker: str, company: Optional[str], 
                          email: Optional[str], timestamp: Optional[str],
-                         pipeline: Optional[str] = None, model: Optional[str] = None, 
+                         llm: Optional[str] = None, pipeline: Optional[str] = None, model: Optional[str] = None, 
                          years: Optional[int] = None, term_growth: Optional[float] = None,
                          wacc: Optional[float] = None, strategy: Optional[str] = None,
                          query: Optional[str] = None, peers: Optional[str] = None,
@@ -565,10 +566,13 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
         env_vars = {
             "SERPAPI_API_KEY": SERPAPI_API_KEY,
             "OPENAI_API_KEY": OPENAI_API_KEY,
+            "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
             "DATA_PATH": "/data",
         }
 
         cmd = ["--ticker", ticker, "--company", company, "--email", email, "--timestamp", timestamp]
+        if llm:
+            cmd.extend(["--llm", llm])
         if pipeline:
             cmd.extend(["--pipeline", pipeline])
         if model:
@@ -761,6 +765,10 @@ async def startup_event():
         logger.warning("⚠️ OPENAI_API_KEY not set")
     else:
         logger.info("✅ OPENAI_API_KEY configured")
+    if not ANTHROPIC_API_KEY:
+        logger.warning("⚠️ ANTHROPIC_API_KEY not set")
+    else:
+        logger.info("✅ ANTHROPIC_API_KEY configured")
 
     # Initialize MongoDB
     mongodb_ready = await init_mongodb()
@@ -851,7 +859,8 @@ async def health_check():
         "data_volume": DATA_VOLUME,
         "api_keys_configured": {
             "serpapi": bool(SERPAPI_API_KEY),
-            "openai": bool(OPENAI_API_KEY)
+            "openai": bool(OPENAI_API_KEY),
+            "anthropic": bool(ANTHROPIC_API_KEY)
         }
     }
 
@@ -864,7 +873,7 @@ async def start_analysis(job: JobRequest, background_tasks: BackgroundTasks):
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker service not available")
 
-    if not SERPAPI_API_KEY or not OPENAI_API_KEY:
+    if not SERPAPI_API_KEY or not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=400, detail="API keys not configured")
     
     if not job.email:
@@ -894,7 +903,7 @@ async def start_analysis(job: JobRequest, background_tasks: BackgroundTasks):
         run_analysis_job,
         job_id, job.ticker, job.company,
         user_email, current_timestamp,
-        job.pipeline, job.model, job.years, job.term_growth,
+        job.llm, job.pipeline, job.model, job.years, job.term_growth,
         job.wacc, job.strategy, job.query, job.peers, job.max_searched, job.min_score,
         job.max_filtered, job.min_confidence, job.scaling, job.adjustment_cap,
     )
@@ -913,7 +922,7 @@ async def process_nl_request_endpoint(nl_req: NLRequest, background_tasks: Backg
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker service not available")
 
-    if not SERPAPI_API_KEY or not OPENAI_API_KEY:
+    if not SERPAPI_API_KEY or not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=400, detail="API keys not configured")
     
     if not nl_req.email:
@@ -948,7 +957,7 @@ async def process_nl_request_endpoint(nl_req: NLRequest, background_tasks: Backg
             run_analysis_job,
             job_id, job_request.ticker, job_request.company,
             user_email, current_timestamp,
-            job_request.pipeline, job_request.model, job_request.years, job_request.term_growth,
+            job_request.llm, job_request.pipeline, job_request.model, job_request.years, job_request.term_growth,
             job_request.wacc, job_request.strategy, job_request.query, job_request.peers, job_request.max_searched, job_request.min_score,
             job_request.max_filtered, job_request.min_confidence, job_request.scaling, job_request.adjustment_cap,
         )
