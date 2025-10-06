@@ -8,6 +8,7 @@ every 10 seconds and manages price updates for WebSocket streaming.
 import asyncio
 import logging
 import yfinance as yf
+import pandas as pd
 from typing import Dict, List, Set, Optional, Callable
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -105,6 +106,7 @@ class StockPriceFetcher:
         
         return StockPrice(
             symbol=symbol.upper(),
+            name=info.get('shortName') or info.get('longName'),
             current_price=current_price,
             previous_close=previous_close,
             open_price=info.get('regularMarketOpen') or (float(latest['Open']) if latest is not None and 'Open' in latest else None),
@@ -117,7 +119,14 @@ class StockPriceFetcher:
             change_percent=change_percent,
             currency=info.get('currency', 'USD'),
             last_updated=datetime.now(),
-            is_market_open=self._is_market_open(info)
+            is_market_open=self._is_market_open(info),
+            # Additional market data
+            bid=info.get('bid'),
+            ask=info.get('ask'),
+            high_52w=info.get('fiftyTwoWeekHigh'),
+            low_52w=info.get('fiftyTwoWeekLow'),
+            avg_volume=info.get('averageVolume'),
+            dividend_yield=info.get('dividendYield')
         )
     
     def _is_market_open(self, info: Dict) -> bool:
@@ -159,6 +168,70 @@ class StockPriceFetcher:
     def cleanup(self):
         """Cleanup resources."""
         self.executor.shutdown(wait=True)
+    
+    async def fetch_historical_data(self, symbol: str, timeframe: str = "1M") -> Optional[Dict]:
+        """Fetch historical data for a symbol."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.executor, self._fetch_historical_data_sync, symbol, timeframe
+            )
+        except Exception as e:
+            logger.error(f"Error fetching historical data for {symbol}: {e}")
+            return None
+    
+    def _fetch_historical_data_sync(self, symbol: str, timeframe: str) -> Optional[Dict]:
+        """Synchronous historical data fetch - runs in thread pool."""
+        try:
+            import yfinance as yf
+            
+            # Map timeframes to yfinance periods
+            period_map = {
+                "1D": "1d",
+                "1W": "5d", 
+                "1M": "1mo",
+                "3M": "3mo",
+                "1Y": "1y",
+                "ALL": "max"
+            }
+            
+            # Map timeframes to appropriate intervals
+            interval_map = {
+                "1D": "5m",   # 5-minute intervals for 1 day
+                "1W": "1h",   # 1-hour intervals for 1 week
+                "1M": "1d",   # Daily intervals for 1 month
+                "3M": "1d",   # Daily intervals for 3 months
+                "1Y": "1wk",  # Weekly intervals for 1 year
+                "ALL": "1mo"  # Monthly intervals for max period
+            }
+            
+            period = period_map.get(timeframe, "1mo")
+            interval = interval_map.get(timeframe, "1d")
+            
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period=period, interval=interval)
+            
+            if hist.empty:
+                return None
+            
+            # Convert to list of data points
+            data_points = []
+            for timestamp, row in hist.iterrows():
+                data_points.append({
+                    "timestamp": timestamp.isoformat(),
+                    "price": float(row['Close']),
+                    "volume": int(row['Volume']) if not pd.isna(row['Volume']) else None
+                })
+            
+            return {
+                "symbol": symbol.upper(),
+                "timeframe": timeframe,
+                "data": data_points
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in historical data fetch for {symbol}: {e}")
+            return None
 
 class PriceManager:
     """
@@ -258,6 +331,10 @@ class PriceManager:
         symbols = [s.upper() for s in symbols]
         return await self.fetcher.fetch_multiple_prices(symbols)
     
+    async def get_historical_data(self, symbol: str, timeframe: str = "1M") -> Optional[Dict]:
+        """Get historical data for a symbol."""
+        return await self.fetcher.fetch_historical_data(symbol, timeframe)
+    
     async def _price_fetch_loop(self):
         """Background loop that fetches prices every 10 seconds."""
         logger.info("🔄 Starting price fetch loop...")
@@ -277,11 +354,23 @@ class PriceManager:
                             # Create price update message
                             update = PriceUpdate(
                                 symbol=symbol,
+                                name=price.name,
                                 current_price=price.current_price or 0.0,
                                 change_amount=price.change_amount or 0.0,
                                 change_percent=price.change_percent or 0.0,
                                 volume=price.volume,
-                                timestamp=price.last_updated
+                                market_cap=price.market_cap,
+                                timestamp=price.last_updated.isoformat(),
+                                # Additional market data
+                                bid=price.bid,
+                                ask=price.ask,
+                                high_52w=price.high_52w,
+                                low_52w=price.low_52w,
+                                day_high=price.day_high,
+                                day_low=price.day_low,
+                                avg_volume=price.avg_volume,
+                                pe_ratio=price.pe_ratio,
+                                dividend_yield=price.dividend_yield
                             )
                             
                             # Notify all subscribers for this symbol

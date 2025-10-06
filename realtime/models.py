@@ -14,6 +14,7 @@ class StockPrice(BaseModel):
     """Model for stock price data from yfinance API."""
     
     symbol: str = Field(..., description="Stock symbol (e.g., AAPL, GOOGL)")
+    name: Optional[str] = Field(None, description="Company name")
     current_price: Optional[float] = Field(None, description="Current stock price")
     previous_close: Optional[float] = Field(None, description="Previous closing price")
     open_price: Optional[float] = Field(None, description="Today's opening price")
@@ -28,6 +29,14 @@ class StockPrice(BaseModel):
     last_updated: datetime = Field(default_factory=datetime.now, description="Last update timestamp")
     is_market_open: Optional[bool] = Field(None, description="Whether market is currently open")
     
+    # Additional market data for enhanced frontend display
+    bid: Optional[float] = Field(None, description="Bid price")
+    ask: Optional[float] = Field(None, description="Ask price")
+    high_52w: Optional[float] = Field(None, description="52-week high")
+    low_52w: Optional[float] = Field(None, description="52-week low")
+    avg_volume: Optional[int] = Field(None, description="Average volume")
+    dividend_yield: Optional[float] = Field(None, description="Dividend yield (if available)")
+    
     class Config:
         json_encoders = {
             datetime: lambda v: v.isoformat()
@@ -38,11 +47,24 @@ class PriceUpdate(BaseModel):
     
     type: str = Field(default="price_update", description="Message type")
     symbol: str = Field(..., description="Stock symbol")
+    name: Optional[str] = Field(None, description="Company name")
     current_price: float = Field(..., description="Current price")
     change_amount: float = Field(..., description="Price change in dollars")
     change_percent: float = Field(..., description="Price change as percentage")
-    timestamp: datetime = Field(default_factory=datetime.now, description="Update timestamp")
-    volume: Optional[int] = Field(None, description="Current volume")
+    volume: Optional[int] = Field(None, description="Current day volume")
+    market_cap: Optional[int] = Field(None, description="Market capitalization")
+    timestamp: str = Field(..., description="Last update time")
+    
+    # Additional market data for enhanced frontend display
+    bid: Optional[float] = Field(None, description="Bid price")
+    ask: Optional[float] = Field(None, description="Ask price")
+    high_52w: Optional[float] = Field(None, description="52-week high")
+    low_52w: Optional[float] = Field(None, description="52-week low")
+    day_high: Optional[float] = Field(None, description="Today's high")
+    day_low: Optional[float] = Field(None, description="Today's low")
+    avg_volume: Optional[int] = Field(None, description="Average volume")
+    pe_ratio: Optional[float] = Field(None, description="P/E ratio (if available)")
+    dividend_yield: Optional[float] = Field(None, description="Dividend yield (if available)")
     
     class Config:
         json_encoders = {
@@ -132,3 +154,17 @@ class HealthCheck(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat()
         }
+
+class HistoricalDataPoint(BaseModel):
+    """Model for historical price data points."""
+    
+    timestamp: str = Field(..., description="ISO timestamp")
+    price: float = Field(..., description="Price at that time")
+    volume: Optional[int] = Field(None, description="Volume (optional)")
+
+class HistoricalData(BaseModel):
+    """Model for historical price data response."""
+    
+    symbol: str = Field(..., description="Stock symbol")
+    timeframe: str = Field(..., description="Timeframe: '1D', '1W', '1M', '3M', '1Y', 'ALL'")
+    data: List[HistoricalDataPoint] = Field(..., description="Array of historical data points")

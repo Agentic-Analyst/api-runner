@@ -13,7 +13,8 @@ from fastapi.responses import JSONResponse
 
 from .models import (
     StockPrice, PriceUpdate, StockSubscription, StockInfo, 
-    MarketStatus, HealthCheck, ErrorResponse, PriceFetchConfig
+    MarketStatus, HealthCheck, ErrorResponse, PriceFetchConfig,
+    HistoricalData, HistoricalDataPoint
 )
 from .price_fetcher import PriceManager, StockPriceFetcher
 
@@ -159,6 +160,40 @@ async def get_multiple_stock_prices(
         raise
     except Exception as e:
         logger.error(f"Error fetching multiple prices: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+
+@router.get("/historical/{symbol}", response_model=HistoricalData)
+async def get_historical_data(
+    symbol: str,
+    timeframe: str = Query("1M", description="Timeframe: '1D', '1W', '1M', '3M', '1Y', 'ALL'"),
+    pm: PriceManager = Depends(get_price_manager)
+) -> HistoricalData:
+    """Get historical price data for a specific stock symbol."""
+    try:
+        symbol = symbol.upper()
+        
+        # Validate timeframe
+        valid_timeframes = ["1D", "1W", "1M", "3M", "1Y", "ALL"]
+        if timeframe not in valid_timeframes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid timeframe. Must be one of: {', '.join(valid_timeframes)}"
+            )
+        
+        historical_data = await pm.get_historical_data(symbol, timeframe)
+        
+        if historical_data is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Historical data not found for symbol {symbol}"
+            )
+        
+        return HistoricalData(**historical_data)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching historical data for {symbol}: {e}")
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 # Subscription Management Endpoints
