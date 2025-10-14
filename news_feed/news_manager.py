@@ -152,32 +152,93 @@ class NewsManager:
                 # Since articles might be older, let's use a more flexible date range
                 filters = {}
                 
-                # Only apply date filter if we want recent articles (days_back < 30)
-                if days_back < 30:
-                    cutoff_date = datetime.now() - timedelta(days=days_back)
-                    filters["publish_date"] = {"$gte": cutoff_date}
+                # For string-based publish_date fields, we need a different approach
+                # Since dates are stored as strings like "Oct 28, 2024", we can't use $gte with datetime
+                # Instead, we'll fetch all articles and filter them in Python
                 
-                # Query with sorting by publish_date descending
-                cursor = collection.find(filters).sort("publish_date", DESCENDING).limit(limit)
-                articles_data = list(cursor)
+                # Query without date filter first, then filter in Python
+                cursor = collection.find(filters).sort("createdAt", DESCENDING).limit(min(limit * 3, 100))  # Get more to filter
+                all_articles_data = list(cursor)
+                
+                # Filter articles by date in Python since publish_date is stored as strings
+                articles_data = []
+                if days_back < 30:
+                    # Use a slightly stricter cutoff - exclude anything exactly at the boundary
+                    cutoff_date = datetime.now() - timedelta(days=days_back, hours=-1)  # Add 1 hour buffer
+                    
+                    for article_data in all_articles_data:
+                        # Try to parse the string date
+                        article_date = None
+                        publish_date_str = article_data.get('publish_date', '')
+                        
+                        # Try different date parsing approaches
+                        if publish_date_str:
+                            try:
+                                # Handle formats like "Oct 28, 2024"
+                                article_date = datetime.strptime(publish_date_str, "%b %d, %Y")
+                            except:
+                                try:
+                                    # Handle formats like "5 days ago", "1 week ago", "2 weeks ago"
+                                    if "ago" in publish_date_str:
+                                        parts = publish_date_str.split()
+                                        if len(parts) >= 3:
+                                            number = int(parts[0])
+                                            unit = parts[1].lower()
+                                            
+                                            if "day" in unit:
+                                                article_date = datetime.now() - timedelta(days=number)
+                                            elif "week" in unit:
+                                                article_date = datetime.now() - timedelta(weeks=number)
+                                            elif "month" in unit:
+                                                article_date = datetime.now() - timedelta(days=number * 30)
+                                            elif "hour" in unit:
+                                                article_date = datetime.now() - timedelta(hours=number)
+                                except:
+                                    # If we can't parse the date, check createdAt as fallback
+                                    created_at = article_data.get('createdAt')
+                                    if created_at:
+                                        try:
+                                            if isinstance(created_at, str):
+                                                article_date = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                                            else:
+                                                article_date = created_at
+                                        except:
+                                            pass
+                        
+                        # Include article only if we successfully parsed the date AND it's within range
+                        if article_date is not None and article_date >= cutoff_date:
+                            articles_data.append(article_data)
+                            
+                        # Stop when we have enough articles
+                        if len(articles_data) >= limit:
+                            break
+                else:
+                    # No date filtering - use all articles up to limit
+                    articles_data = all_articles_data[:limit]
                 
                 # If no articles found with date filter, try without date filter but limit more strictly
-                if not articles_data and "publish_date" in filters:
-                    logger.info(f"No recent articles for {ticker}, trying without date filter...")
-                    filters_no_date = {k: v for k, v in filters.items() if k != "publish_date"}
-                    cursor = collection.find(filters_no_date).sort("publish_date", DESCENDING).limit(limit)
-                    articles_data = list(cursor)
+                if not articles_data and days_back < 30:
+                    logger.info(f"No recent articles for {ticker}, using all available articles...")
+                    articles_data = all_articles_data[:limit]
                 
-                # Debug: Check total articles in collection
+                # Debug: Check total articles in collection  
                 total_in_collection = collection.count_documents({})
-                total_matching_filters = collection.count_documents(filters)
+                cutoff_date_str = f"last {days_back} days" if days_back < 30 else "no filter"
                 
                 logger.info(f"Database debug for {ticker}: "
                            f"total_articles={total_in_collection}, "
-                           f"matching_filters={total_matching_filters}, "
-                           f"cutoff_date={cutoff_date if days_back < 30 else 'no_filter'}, "
-                           f"filters={filters}, "
-                           f"found_articles={len(articles_data)}")
+                           f"all_fetched={len(all_articles_data)}, "
+                           f"date_filter={cutoff_date_str}, "
+                           f"filtered_articles={len(articles_data)}")
+                
+                # Log sample dates for debugging
+                if articles_data and len(articles_data) > 0:
+                    sample_dates = []
+                    for i, article in enumerate(articles_data[:3]):
+                        publish_date = article.get('publish_date', 'N/A')
+                        created_at = article.get('createdAt', 'N/A') 
+                        sample_dates.append(f"[{i+1}] publish_date: {publish_date}, createdAt: {created_at}")
+                    logger.info(f"Sample dates for {ticker}: {'; '.join(sample_dates)}")
                 
                 # Convert to Article objects then to NewsArticle
                 articles = []

@@ -32,6 +32,8 @@ class NewsWebSocketConnection:
         self.user_id: Optional[str] = None
         self.connected_at = datetime.now()
         self.last_ping = datetime.now()
+        self._is_dead = False  # Track if connection is dead to prevent cascading errors
+        self._streaming_task: Optional[asyncio.Task] = None  # Track active streaming task
         self.subscription_settings = {
             "limit": 20,
             "days_back": 7,
@@ -39,47 +41,69 @@ class NewsWebSocketConnection:
         }
     
     async def send_message(self, message: dict):
-        """Send JSON message to client."""
+        """Send JSON message to client with proper state checking."""
         try:
-            if self.websocket.client_state == WebSocketState.CONNECTED:
+            # Check if WebSocket is still connected
+            if (hasattr(self.websocket, 'client_state') and 
+                self.websocket.client_state == WebSocketState.CONNECTED):
                 await self.websocket.send_text(json.dumps(message, default=str))
+            else:
+                logger.debug(f"News connection {self.connection_id} not connected, skipping message send")
         except Exception as e:
-            logger.debug(f"News connection {self.connection_id} closed during send: {e}")
-            raise
+            # Don't re-raise exceptions for closed connections to prevent cascading errors
+            logger.debug(f"News connection {self.connection_id} failed to send message: {e}")
+            # Mark connection as dead to prevent further attempts
+            if hasattr(self, '_is_dead'):
+                self._is_dead = True
     
     async def send_news_update(self, update: NewsStreamUpdate):
-        """Send news article update to client."""
+        """Send news update to client."""
+        if hasattr(self, '_is_dead') and self._is_dead:
+            return
         message = {
-            "type": "news_update",
-            "data": update.dict(),
-            "timestamp": datetime.now().isoformat()
+            "type": "news_update", 
+            "data": update.dict()
         }
         await self.send_message(message)
-    
+
     async def send_status_update(self, status: NewsStreamStatus):
         """Send status update to client."""
+        if hasattr(self, '_is_dead') and self._is_dead:
+            return
         message = {
-            "type": "status_update", 
-            "data": status.dict(),
-            "timestamp": datetime.now().isoformat()
+            "type": "status_update",
+            "data": status.dict()
         }
         await self.send_message(message)
-    
-    async def send_error(self, error: str, message: str, ticker: str = None):
-        """Send error message to client."""
-        error_msg = {
-            "type": "error",
-            "data": {
-                "error": error,
-                "message": message,
-                "ticker": ticker,
-                "timestamp": datetime.now().isoformat()
+
+    async def send_error(self, error: str, message: str, ticker: str = ""):
+        """Send error message to client, but only if connection is still alive."""
+        try:
+            # Don't try to send error messages if connection is already dead
+            if (hasattr(self, '_is_dead') and self._is_dead):
+                logger.debug(f"Connection {self.connection_id} is dead, skipping error message send")
+                return
+                
+            error_msg = {
+                "type": "error",
+                "data": {
+                    "error": error,
+                    "message": message,
+                    "ticker": ticker,
+                    "timestamp": datetime.now().isoformat()
+                }
             }
-        }
-        await self.send_message(error_msg)
+            await self.send_message(error_msg)
+        except Exception as e:
+            # Prevent cascading errors - if we can't send error messages, just log
+            logger.debug(f"Failed to send error message to {self.connection_id}: {e}")
+            if hasattr(self, '_is_dead'):
+                self._is_dead = True
     
     async def send_completion(self, tickers: List[str], total_articles: int):
         """Send completion notification."""
+        if hasattr(self, '_is_dead') and self._is_dead:
+            return
         completion_msg = {
             "type": "completed",
             "data": {
@@ -94,6 +118,17 @@ class NewsWebSocketConnection:
     def is_subscribed_to(self, ticker: str) -> bool:
         """Check if connection is subscribed to a ticker."""
         return ticker.upper() in self.subscribed_tickers
+
+    def cancel_streaming_task(self):
+        """Cancel any active streaming task for this connection."""
+        if self._streaming_task and not self._streaming_task.done():
+            self._streaming_task.cancel()
+            self._streaming_task = None
+
+    def set_streaming_task(self, task: asyncio.Task):
+        """Set the active streaming task, canceling any previous one."""
+        self.cancel_streaming_task()
+        self._streaming_task = task
 
 
 class NewsWebSocketManager:
@@ -139,10 +174,15 @@ class NewsWebSocketManager:
                     await self._handle_message(connection, message)
                 except WebSocketDisconnect:
                     logger.info(f"📰 News WebSocket {connection_id} disconnected")
+                    connection._is_dead = True  # Mark as dead to prevent further message attempts
                     break
                 except Exception as e:
                     logger.error(f"❌ Error handling news message from {connection_id}: {e}")
-                    await connection.send_error("internal_error", "Internal server error")
+                    try:
+                        await connection.send_error("internal_error", "Internal server error")
+                    except:
+                        # If we can't send error messages, connection is likely dead
+                        connection._is_dead = True
                 
         except Exception as e:
             logger.error(f"❌ Unexpected error for news WebSocket {connection_id}: {e}")
@@ -266,7 +306,9 @@ class NewsWebSocketManager:
             temp_settings = connection.subscription_settings.copy()
             connection.subscription_settings["force_refresh"] = True
             
-            asyncio.create_task(self._stream_news_for_connection(connection, tickers))
+            # Cancel any existing streaming task and start a new one
+            task = asyncio.create_task(self._stream_news_for_connection(connection, tickers))
+            connection.set_streaming_task(task)
             
             # Restore original settings
             connection.subscription_settings = temp_settings
@@ -414,6 +456,10 @@ class NewsWebSocketManager:
             return
         
         connection = self.connections[connection_id]
+        # Mark connection as dead to prevent any further message attempts
+        connection._is_dead = True
+        # Cancel any active streaming task
+        connection.cancel_streaming_task()
         auto_update_removed = []
         
         # Remove from ticker subscribers
@@ -520,6 +566,13 @@ class NewsWebSocketManager:
             })
             
             # Subscribe to each ticker
+            # Check if this is a new subscription vs duplicate
+            current_subscriptions = set(connection.subscribed_tickers)
+            requested_tickers_set = set(ticker.upper() for ticker in tickers)
+            
+            # Only restart streaming if the subscription actually changed
+            subscription_changed = current_subscriptions != requested_tickers_set
+            
             subscribed = []
             new_tickers = []
             
@@ -528,6 +581,10 @@ class NewsWebSocketManager:
                 
                 # Check if this is a new ticker subscription
                 was_subscribed = ticker in self.ticker_subscribers
+                is_new_for_connection = ticker not in connection.subscribed_tickers
+                
+                if is_new_for_connection:
+                    new_tickers.append(ticker)
                 
                 # Add to connection subscriptions
                 connection.subscribed_tickers.add(ticker)
@@ -559,10 +616,15 @@ class NewsWebSocketManager:
                 }
             })
             
-            logger.info(f"📰 WebSocket {connection.connection_id} subscribed to: {subscribed}")
-            
-            # Start streaming news for subscribed tickers
-            asyncio.create_task(self._stream_news_for_connection(connection, subscribed))
+            # Log appropriately based on whether this is new or duplicate
+            if subscription_changed or new_tickers:
+                logger.info(f"📰 WebSocket {connection.connection_id} subscribed to: {subscribed} (new: {new_tickers})")
+                
+                # Start streaming news for subscribed tickers (cancel any existing task first)
+                task = asyncio.create_task(self._stream_news_for_connection(connection, subscribed))
+                connection.set_streaming_task(task)
+            else:
+                logger.debug(f"📰 WebSocket {connection.connection_id} duplicate subscription ignored: {subscribed}")
             
         except Exception as e:
             logger.error(f"Error handling news subscription: {e}")
