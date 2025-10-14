@@ -31,7 +31,7 @@ import subprocess
 
 import docker
 import docker.errors
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
@@ -43,7 +43,6 @@ from starlette.middleware import Middleware
 from agents.gateway_agent import GatewayAgent
 from auth_oauth import router as oauth_router  # noqa: E402
 from md_pdf_converter import convert_md_to_pdf
-from database import init_mongodb, close_mongodb, check_mongodb_health, user_router, portfolio_router
 
 # Real-time stock price system
 from realtime import (
@@ -52,6 +51,12 @@ from realtime import (
     PriceFetchConfig
 )
 from realtime.stock_api import init_realtime_api
+
+# News feed system
+from news_feed import news_router
+from news_feed.api import init_news_manager, close_news_manager
+from news_feed.news_auto_updater import NewsUpdateManager, NewsUpdateConfig
+from news_feed.news_websocket import init_news_websocket_manager, get_news_websocket_manager
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -71,6 +76,8 @@ logger = logging.getLogger(__name__)
 # Global real-time services
 price_manager: Optional[PriceManager] = None
 websocket_manager = None
+news_auto_updater: Optional[NewsUpdateManager] = None
+news_websocket_manager = None
 
 # --- Env / App init ---
 def _csv_env(name: str, default: str = "") -> List[str]:
@@ -124,9 +131,8 @@ app = FastAPI(
 # Routers
 app.include_router(oauth_router)
 app.include_router(code_router)
-app.include_router(user_router)
-app.include_router(portfolio_router)
 app.include_router(stock_router)
+app.include_router(news_router)
 
 # Health endpoint (useful for container probes)
 @app.get("/healthz")
@@ -748,7 +754,7 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
 # ------------- Startup / health -------------
 @app.on_event("startup")
 async def startup_event():
-    global price_manager, websocket_manager
+    global price_manager, websocket_manager, news_auto_updater, news_websocket_manager
     
     logger.info("🚀 Starting Stock Analyst API Runner...")
     docker_ready = init_docker_client()
@@ -770,12 +776,52 @@ async def startup_event():
     else:
         logger.info("✅ ANTHROPIC_API_KEY configured")
 
-    # Initialize MongoDB
-    mongodb_ready = await init_mongodb()
-    if mongodb_ready:
-        logger.info("✅ MongoDB connected successfully")
+    # Initialize news feed system
+    news_ready = await init_news_manager()
+    if news_ready:
+        logger.info("✅ News feed system initialized successfully")
+        
+        # Initialize news auto-updater
+        try:
+            logger.info("🚀 Starting automatic news update system...")
+            
+            # Create optimized news auto-updater with 30-minute intervals and API rate limiting
+            news_config = NewsUpdateConfig(
+                update_interval=86400,  # 24 hours in seconds (reduced from 5 min)
+                max_tickers_per_batch=2,  # Reduced from 10 for API limits
+                days_back=1,  # Only check last 1 day (reduced from 7)
+                articles_limit=10,  # Reduced from 20
+                timeout_seconds=180,
+                force_refresh=False,
+                min_update_interval=3600,  # Minimum 1 hour between updates per ticker
+                max_api_calls_per_hour=20  # SerpAPI rate limiting
+            )
+            news_auto_updater = NewsUpdateManager(news_config)
+            
+            # Initialize and start auto-updater
+            auto_update_ready = await news_auto_updater.initialize()
+            if auto_update_ready:
+                await news_auto_updater.start()
+                logger.info("✅ News auto-updater started - updating every 30 minutes with smart rate limiting")
+                
+                # Initialize news WebSocket manager with auto-updater integration
+                from news_feed.news_manager import NewsManager
+                news_manager = NewsManager()
+                await news_manager.initialize()
+                
+                news_websocket_manager = init_news_websocket_manager(news_manager, news_auto_updater)
+                news_websocket_manager.set_auto_updater(news_auto_updater)
+                
+                logger.info("✅ News WebSocket manager initialized with auto-updates")
+                logger.info("📡 News WebSocket endpoint available at /api/news/ws")
+            else:
+                logger.warning("⚠️ News auto-updater failed to initialize")
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to start news auto-updater: {e}")
+            logger.warning("⚠️ Automatic news updates will be unavailable")
     else:
-        logger.warning("⚠️ MongoDB not available - user features may be limited")
+        logger.warning("⚠️ News feed system not available")
 
     # Initialize real-time stock price system
     try:
@@ -811,7 +857,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global price_manager, websocket_manager
+    global price_manager, websocket_manager, news_auto_updater, news_websocket_manager
     
     logger.info("🔌 Shutting down API Runner...")
     
@@ -825,8 +871,22 @@ async def shutdown_event():
     except Exception as e:
         logger.error(f"❌ Error stopping real-time services: {e}")
     
-    # Shutdown MongoDB
-    await close_mongodb()
+    # Shutdown news auto-updater
+    try:
+        if news_auto_updater:
+            logger.info("🛑 Stopping news auto-updater...")
+            await news_auto_updater.stop()
+            logger.info("✅ News auto-updater stopped")
+    except Exception as e:
+        logger.error(f"❌ Error stopping news auto-updater: {e}")
+    
+    # Shutdown news feed system
+    try:
+        await close_news_manager()
+        logger.info("✅ News feed system stopped")
+    except Exception as e:
+        logger.error(f"❌ Error stopping news feed system: {e}")
+    
     logger.info("✅ API Runner shutdown complete")
 
 @app.get("/")
@@ -841,20 +901,27 @@ async def root():
 @app.get("/health")
 async def health_check():
     docker_status = "connected" if docker_client else "disconnected"
-    mongodb_status = "connected" if await check_mongodb_health() else "disconnected"
-    
+
     # Check real-time service status
     realtime_status = "stopped"
     websocket_status = "integrated"  # WebSocket is now integrated with FastAPI
     if price_manager and price_manager.is_running:
         realtime_status = "running"
     
+    # Check news feed status
+    try:
+        from news_feed.api import get_news_manager
+        news_manager = get_news_manager()
+        news_status = "running" if news_manager else "stopped"
+    except:
+        news_status = "not_initialized"
+    
     return {
         "status": "healthy",
         "docker": docker_status,
-        "mongodb": mongodb_status,
         "realtime_prices": realtime_status,
         "websocket_server": websocket_status,
+        "news_feed": news_status,
         "backend_image": BACKEND_IMAGE,
         "data_volume": DATA_VOLUME,
         "api_keys_configured": {
@@ -863,6 +930,44 @@ async def health_check():
             "anthropic": bool(ANTHROPIC_API_KEY)
         }
     }
+
+@app.get("/api/news/auto-updater/status")
+async def news_auto_updater_status():
+    """Get status of the news auto-updater system."""
+    global news_auto_updater, news_websocket_manager
+    
+    if not news_auto_updater:
+        return {
+            "status": "not_initialized",
+            "message": "News auto-updater not initialized"
+        }
+    
+    try:
+        status = news_auto_updater.get_status()
+        
+        # Add WebSocket connection info
+        if news_websocket_manager:
+            status["websocket_connections"] = news_websocket_manager.get_connection_count()
+            status["subscribed_tickers_websocket"] = news_websocket_manager.get_all_subscribed_tickers()
+        
+        return status
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.websocket("/api/news/ws")
+async def news_websocket_endpoint(websocket):
+    """WebSocket endpoint for real-time news streaming with automatic updates."""
+    global news_websocket_manager
+    
+    if not news_websocket_manager:
+        await websocket.close(code=1011, reason="News WebSocket service not available")
+        return
+    
+    await news_websocket_manager.handle_websocket_connection(websocket)
 
 # ------------- Create job -------------
 @app.post("/run", response_model=JobResponse)
