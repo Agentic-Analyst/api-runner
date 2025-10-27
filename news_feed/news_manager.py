@@ -44,6 +44,8 @@ class NewsManager:
         self.serpapi_key = os.getenv("SERPAPI_API_KEY")
         self.openai_key = os.getenv("OPENAI_API_KEY")
         self.anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        self.MONGO_URI = os.getenv("MONGO_URI")
+        self.MONGO_DB = os.getenv("MONGO_DB")
     
     async def initialize(self) -> bool:
         """Initialize MongoDB connection and vynn_core components"""
@@ -298,9 +300,9 @@ class NewsManager:
                 "SERPAPI_API_KEY": self.serpapi_key,
                 "OPENAI_API_KEY": self.openai_key,
                 "ANTHROPIC_API_KEY": self.anthropic_key,
+                "MONGO_URI": self.MONGO_URI,
+                "MONGO_DB": self.MONGO_DB,
                 "DATA_PATH": "/data",
-                "MONGO_URI": os.getenv("MONGO_URI"),
-                "MONGO_DB": os.getenv("MONGO_DB"),
             }
             
             # Command to run search-news pipeline

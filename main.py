@@ -149,6 +149,8 @@ DATA_VOLUME = os.getenv("DATA_VOLUME", "stockdata")
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB = os.getenv("MONGO_DB")
 
 # --------- Utilities for new layout ---------
 def job_root(job: Dict) -> str:
@@ -573,6 +575,8 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
             "SERPAPI_API_KEY": SERPAPI_API_KEY,
             "OPENAI_API_KEY": OPENAI_API_KEY,
             "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+            "MONGO_URI": MONGO_URI,
+            "MONGO_DB": MONGO_DB,
             "DATA_PATH": "/data",
         }
 
