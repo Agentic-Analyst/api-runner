@@ -787,7 +787,7 @@ async def startup_event():
             
             # Create optimized news auto-updater with 30-minute intervals and API rate limiting
             news_config = NewsUpdateConfig(
-                update_interval=86400,  # 24 hours in seconds (reduced from 5 min)
+                update_interval=7200,  # 2 hours in seconds (reduced from 5 min)
                 max_tickers_per_batch=2,  # Reduced from 10 for API limits
                 days_back=1,  # Only check last 1 day (reduced from 7)
                 articles_limit=10,  # Reduced from 20
@@ -1438,237 +1438,81 @@ async def get_job_logs(job_id: str):
         "last_activity": job.get("last_activity")
     }
 
-# ------------- Download specific file -------------
-@app.get("/jobs/{job_id}/files/{filename}")
-async def download_file(job_id: str, filename: str):
+# ------------- Download Excel Financial Model -------------
+@app.get("/jobs/{job_id}/download/financial-model")
+async def download_financial_model(job_id: str):
     """
-    Download a specific top-level file from job results.
-    Supported: info.log, screening_report.md, screening_data.json, price_adjustment_explanation_latest.md, 
-               technical_analysis_latest.md, professional_analyst_report_latest.md
+    Download the Excel financial model (.xlsx file)
     """
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
 
     job = jobs[job_id]
-    base = job_root(job)
+    ticker = (job.get("ticker") or "").upper()
+    
+    # Container-side path (the API container sees the volume at /data)
+    base = Path(job_root(job))  # e.g. /data/<email>/<TICKER>/<timestamp>
+    xlsx_path = base / "models" / f"{ticker}_financial_model.xlsx"
 
-    supported = {
-        "info.log": "text/plain",
-        "screening_report.md": "text/markdown",
-        "screening_data.json": "application/json",
-        "price_adjustment_explanation_latest.md": "text/markdown",
-        "technical_analysis_latest.md": "text/markdown",
-        "professional_analyst_report_latest.md": "text/markdown",
-    }
-    if filename not in supported:
-        raise HTTPException(status_code=400, detail=f"Unsupported filename '{filename}'. Supported: {list(supported.keys())}")
+    # Optional: small stability wait to avoid half-written file
+    for _ in range(6):  # up to ~3s
+        if xlsx_path.exists() and xlsx_path.stat().st_size > 0:
+            break
+        time.sleep(0.5)
 
-    try:
-        if filename.startswith("price_adjustment_explanation") or \
-           filename.startswith("technical_analysis") or \
-           filename.startswith("professional_analyst_report"):
-            path = f"{base}/reports/{filename}"
-        elif filename.startswith("screening"):
-            path = f"{base}/screened/{filename}"
-        else:
-            path = f"{base}/{filename}"
+    if not xlsx_path.exists():
+        raise HTTPException(status_code=404, detail="Financial model Excel not found")
 
-        result = docker_client.containers.run(
-            "alpine:latest",
-            command=f"sh -c 'cat {shlex.quote(path)}'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-            remove=True,
-            detach=False
-        )
-        media_type = supported[filename]
-        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-        return StreamingResponse(BytesIO(result), media_type=media_type, headers=headers)
-    except Exception as e:
-        logger.error(f"Error reading {filename} for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not read {filename}: {str(e)}")
+    return FileResponse(
+        path=str(xlsx_path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"{ticker}_financial_model.xlsx",
+        headers={
+            "Cache-Control": "no-store, private",
+            "Content-Disposition": f'attachment; filename="{ticker}_financial_model.xlsx"',
+            "Content-Transfer-Encoding": "binary",
+        },
+    )
 
-# ------------- Get full info.log as JSON -------------
-@app.get("/jobs/{job_id}/info-log")
-async def get_info_log(job_id: str):
+# ------------- Download Professional Analysis Report as PDF -------------
+@app.get("/jobs/{job_id}/download/professional-report")
+async def download_professional_report(job_id: str):
+    """
+    Download professional analysis report as PDF (converted from markdown)
+    """
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
 
     job = jobs[job_id]
-    base = job_root(job)
+    ticker = (job.get("ticker") or "").upper()
+    
+    # Container-side path
+    base = Path(job_root(job))
+    md_path = base / "reports" / f"{ticker}_Professional_Analysis_Report.md"
+
+    # Stability wait
+    for _ in range(6):
+        if md_path.exists() and md_path.stat().st_size > 0:
+            break
+        time.sleep(0.5)
+
+    if not md_path.exists():
+        raise HTTPException(status_code=404, detail="Professional analysis report not found")
 
     try:
-        temp_container = docker_client.containers.run(
-            "alpine:latest",
-            command=f"cat {shlex.quote(base)}/info.log",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-            remove=True,
-            detach=False
-        )
-        log_content = temp_container.decode('utf-8')
-        return {
-            "job_id": job_id,
-            "ticker": job.get('ticker', '').upper(),
-            "log_content": log_content,
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Error reading info.log for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not read info.log: {str(e)}")
-
-# ------------- Zip searched articles -------------
-@app.get("/jobs/{job_id}/download/searched-articles")
-async def download_searched_articles(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
-
-    job = jobs[job_id]
-    base = job_root(job)
-    ticker = (job.get('ticker') or '').upper()
-
-    try:
-        list_result = docker_client.containers.run(
-            "alpine:latest",
-            command=f"sh -c 'if [ -d {shlex.quote(base)}/searched ]; then find {shlex.quote(base)}/searched -name \"*.md\" -type f; fi'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-            remove=True,
-            detach=False
-        )
-        file_list = [p.strip() for p in list_result.decode('utf-8').splitlines() if p.strip().endswith(".md")]
-
-        if not file_list:
-            raise HTTPException(status_code=404, detail="No searched articles found")
-
-        buf = BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for path in file_list:
-                try:
-                    content = docker_client.containers.run(
-                        "alpine:latest",
-                        command=f"sh -c 'cat {shlex.quote(path)}'",
-                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                        remove=True,
-                        detach=False
-                    )
-                    zipf.writestr(os.path.basename(path), content)
-                except Exception as e:
-                    logger.warning(f"Could not read file {path}: {e}")
-                    continue
-
-        buf.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_searched_articles.zip"'}
-        return StreamingResponse(buf, media_type="application/zip", headers=headers)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error creating searched articles zip for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not create zip file: {str(e)}")
-
-# ------------- Zip filtered articles -------------
-@app.get("/jobs/{job_id}/download/filtered-articles")
-async def download_filtered_articles(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
-
-    job = jobs[job_id]
-    base = job_root(job)
-    ticker = (job.get('ticker') or '').upper()
-
-    try:
-        list_result = docker_client.containers.run(
-            "alpine:latest",
-            command=f"sh -c 'if [ -d {shlex.quote(base)}/filtered ]; then find {shlex.quote(base)}/filtered -name \"filtered_*.md\" -type f; fi'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-            remove=True,
-            detach=False
-        )
-        file_list = [p.strip() for p in list_result.decode('utf-8').splitlines() if p.strip().endswith(".md")]
-
-        if not file_list:
-            raise HTTPException(status_code=404, detail="No filtered articles found")
-
-        # Try to include index CSV if present
-        index_content: Optional[bytes] = None
-        try:
-            idx = docker_client.containers.run(
-                "alpine:latest",
-                command=f"sh -c 'cat {shlex.quote(base)}/filtered/filtered_articles_index.csv'",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            index_content = idx if idx else None
-        except Exception:
-            index_content = None
-
-        buf = BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for path in file_list:
-                try:
-                    content = docker_client.containers.run(
-                        "alpine:latest",
-                        command=f"sh -c 'cat {shlex.quote(path)}'",
-                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                        remove=True,
-                        detach=False
-                    )
-                    zipf.writestr(os.path.basename(path), content)
-                except Exception as e:
-                    logger.warning(f"Could not read file {path}: {e}")
-                    continue
-
-            if index_content:
-                zipf.writestr("filtered_articles_index.csv", index_content)
-
-        buf.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_filtered_articles.zip"'}
-        return StreamingResponse(buf, media_type="application/zip", headers=headers)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error creating filtered articles zip for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not create zip file: {str(e)}")
-
-# ------------- Convert screening_report.md -> PDF -------------
-@app.get("/jobs/{job_id}/download/screening-report")
-async def download_screening_report(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
-
-    job = jobs[job_id]
-    base = job_root(job)
-    ticker = (job.get('ticker') or '').upper()
-
-    try:
-        result = docker_client.containers.run(
-            "alpine:latest",
-            command=f"sh -c 'cat {shlex.quote(base)}/screened/screening_report.md'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-            remove=True,
-            detach=False
-        )
-        if not result:
-            raise HTTPException(status_code=404, detail="Screening report not found")
-        md_content = result.decode('utf-8')
+        # Read markdown content
+        with open(md_path, 'r', encoding='utf-8') as f:
+            md_content = f.read()
+        
+        # Convert to PDF
         pdf_bytes = convert_md_to_pdf(md_content, ticker)
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_screening_report.pdf"'}
+        
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_Professional_Analysis_Report.pdf"'}
         return StreamingResponse(BytesIO(pdf_bytes), media_type='application/pdf', headers=headers)
-    except HTTPException:
-        raise
+        
     except Exception as e:
-        logger.error(f"Error downloading converted PDF screening report for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not read or convert screening report: {str(e)}")
+        logger.error(f"Error downloading professional report for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read or convert professional report: {str(e)}")
 
 # ------------- Tar all results (entire timestamp folder) -------------
 @app.get("/jobs/{job_id}/download/all-results")
@@ -1769,495 +1613,36 @@ async def download_all_results(job_id: str):
         headers=headers,
     )
 
-# ------------- Download financials_annual JSON -------------
-@app.get("/jobs/{job_id}/download/financials-annual")
-async def download_financials_annual(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
-
-    job = jobs[job_id]
-    base = job_root(job)
-    ticker = (job.get('ticker') or '').upper()
-
-    try:
-        result = docker_client.containers.run(
-            "alpine:latest",
-            command=f"sh -c 'cat {shlex.quote(base)}/financials/financials_annual_modeling_latest.json'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-            remove=True,
-            detach=False
-        )
-        if not result:
-            raise HTTPException(status_code=404, detail="Financials annual JSON not found")
-
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_financials_annual_modeling_latest.json"'}
-        return StreamingResponse(BytesIO(result), media_type='application/json', headers=headers)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error downloading financials annual for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not read financials annual file: {str(e)}")
-
-# ------------- Download peer financials -------------
-@app.get("/jobs/{job_id}/download/peer-financials")
-async def download_peer_financials(job_id: str):
-    """
-    Download financials for all peer companies as a ZIP file.
-    Only includes peer financials, not the main company.
-    """
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
-
-    job = jobs[job_id]
-    base = job_root(job)
-    ticker = (job.get('ticker') or '').upper()
-
-    try:
-        # Find peer directories
-        peer_base = str(Path(base))  # Search /data/<email>/<TICKER>/<timestamp>
-        logger.info(f"Looking for peer directories in: {peer_base}")
-        
-        # First, let's see what directories actually exist
-        ls_result = docker_client.containers.run(
-            "alpine:latest",
-            command=f"sh -c 'ls -la {shlex.quote(peer_base)} 2>/dev/null || echo \"Directory not found\"'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-            remove=True,
-            detach=False
-        )
-        logger.info(f"Directory listing: {ls_result.decode('utf-8')}")
-        
-        peer_list_result = docker_client.containers.run(
-            "alpine:latest",
-            command=f"sh -c 'find {shlex.quote(peer_base)} -maxdepth 1 -type d -name \"temp_peer_*\" | head -20'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-            remove=True,
-            detach=False
-        )
-        
-        peer_dirs = [p.strip() for p in peer_list_result.decode('utf-8').splitlines() if p.strip()]
-        logger.info(f"Found peer directories: {peer_dirs}")
-        
-        if not peer_dirs:
-            raise HTTPException(status_code=404, detail=f"No peer financials found. Searched in: {peer_base}. Available directories: {ls_result.decode('utf-8').strip()}")
-        
-        # Create ZIP file with peer financials
-        buf = BytesIO()
-        peer_count = 0
-        
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for peer_dir in peer_dirs:
-                try:
-                    # Extract peer ticker from directory name (temp_peer_AAPL -> AAPL)
-                    peer_ticker = peer_dir.split('_')[-1].upper()
-                    peer_financials_path = f"{peer_dir}/financials/financials_annual_modeling_latest.json"
-                    
-                    peer_result = docker_client.containers.run(
-                        "alpine:latest",
-                        command=f"sh -c 'if [ -f {shlex.quote(peer_financials_path)} ]; then cat {shlex.quote(peer_financials_path)}; fi'",
-                        volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                        remove=True,
-                        detach=False
-                    )
-                    
-                    if peer_result:
-                        zipf.writestr(f"{peer_ticker}_financials_annual_modeling_latest.json", peer_result)
-                        peer_count += 1
-                        logger.info(f"Added peer financials for {peer_ticker}")
-                    else:
-                        logger.warning(f"No financials found for peer {peer_ticker}")
-                        
-                except Exception as e:
-                    logger.error(f"Error processing peer financials for {peer_dir}: {e}")
-                    continue
-        
-        if peer_count == 0:
-            raise HTTPException(status_code=404, detail="No valid peer financial data found")
-        
-        buf.seek(0)
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_peer_financials_annual.zip"'}
-        return StreamingResponse(buf, media_type="application/zip", headers=headers)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error creating peer financials ZIP for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not create peer financials ZIP file: {str(e)}")
-
-# ------------- Download financial model Excel -------------
-@app.get("/jobs/{job_id}/download/financial-model")
-async def download_financial_model(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    job = jobs[job_id]
-    ticker = (job.get("ticker") or "").upper()
-
-    # Container-side path (the API container sees the volume at /data)
-    base = Path(job_root(job))  # e.g. /data/<email>/<TICKER>/<timestamp>
-    xlsx_path = base / "models" / "financial_model_comprehensive_latest.xlsx"
-
-    # Optional: small stability wait to avoid half-written ZIP
-    for _ in range(6):  # up to ~3s
-        if xlsx_path.exists() and xlsx_path.stat().st_size > 0:
-            break
-        time.sleep(0.5)
-
-    if not xlsx_path.exists():
-        raise HTTPException(status_code=404, detail="Financial model Excel not found")
-
-    return FileResponse(
-        path=str(xlsx_path),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=f"{ticker}_financial_model_comprehensive_latest.xlsx",
-        headers={
-            "Cache-Control": "no-store, private",
-            "Content-Disposition": f'attachment; filename="{ticker}_financial_model_comprehensive_latest.xlsx"',
-            "Content-Transfer-Encoding": "binary",
-        },
-    )
-
-@app.get("/jobs/{job_id}/download/financial-model-comparable")
-async def download_financial_model_comparable(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    job = jobs[job_id]
-    ticker = (job.get("ticker") or "").upper()
-
-    # Container-side path (the API container sees the volume at /data)
-    base = Path(job_root(job))  # e.g. /data/<email>/<TICKER>/<timestamp>
-    xlsx_path = base / "models" / "financial_model_comparable_latest.xlsx"
-
-    # Optional: small stability wait to avoid half-written ZIP
-    for _ in range(6):  # up to ~3s
-        if xlsx_path.exists() and xlsx_path.stat().st_size > 0:
-            break
-        time.sleep(0.5)
-
-    if not xlsx_path.exists():
-        raise HTTPException(status_code=404, detail="Financial model Excel not found")
-
-    return FileResponse(
-        path=str(xlsx_path),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=f"{ticker}_financial_model_comparable_latest.xlsx",
-        headers={
-            "Cache-Control": "no-store, private",
-            "Content-Disposition": f'attachment; filename="{ticker}_financial_model_comparable_latest.xlsx"',
-            "Content-Transfer-Encoding": "binary",
-        },
-    )
-
-# ------------- Download filtered_report.md -------------
-@app.get("/jobs/{job_id}/download/filtered-report")
-async def download_filtered_report(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
-
-    job = jobs[job_id]
-    base = job_root(job)
-    ticker = (job.get('ticker') or '').upper()
-
-    try:
-        result = docker_client.containers.run(
-            "alpine:latest",
-            command=f"sh -c 'cat {shlex.quote(base)}/filtered/filtered_report.md'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-            remove=True,
-            detach=False
-        )
-        if not result:
-            raise HTTPException(status_code=404, detail="Filtered report not found")
-
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_filtered_report.md"'}
-        return StreamingResponse(BytesIO(result), media_type='text/markdown', headers=headers)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error downloading filtered report for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not read filtered report file: {str(e)}")
-
-# ------------- Download technical_analysis_latest.md -------------
-@app.get("/jobs/{job_id}/download/technical-analysis")
-async def download_technical_analysis(job_id: str):
-    """
-    Download technical analysis report as PDF
-    """
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
-
-    job = jobs[job_id]
-    base = job_root(job)
-    ticker = (job.get('ticker') or '').upper()
-
-    try:
-        result = docker_client.containers.run(
-            "alpine:latest",
-            command=f"sh -c 'cat {shlex.quote(base)}/reports/technical_analysis_latest.md'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-            remove=True,
-            detach=False
-        )
-        if not result:
-            raise HTTPException(status_code=404, detail="Technical analysis report not found")
-        
-        md_content = result.decode('utf-8')
-        pdf_bytes = convert_md_to_pdf(md_content, ticker)
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_technical_analysis_latest.pdf"'}
-        return StreamingResponse(BytesIO(pdf_bytes), media_type='application/pdf', headers=headers)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error downloading technical analysis for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not read technical analysis file: {str(e)}")
-
-# ------------- Download professional_analyst_report_latest.md -------------
-@app.get("/jobs/{job_id}/download/professional-analyst-report")
-async def download_professional_analyst_report(job_id: str):
-    """
-    Download professional analyst report as PDF
-    """
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
-
-    job = jobs[job_id]
-    base = job_root(job)
-    ticker = (job.get('ticker') or '').upper()
-
-    try:
-        result = docker_client.containers.run(
-            "alpine:latest",
-            command=f"sh -c 'cat {shlex.quote(base)}/reports/professional_analyst_report_latest.md'",
-            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-            remove=True,
-            detach=False
-        )
-        if not result:
-            raise HTTPException(status_code=404, detail="Professional analyst report not found")
-        
-        md_content = result.decode('utf-8')
-        pdf_bytes = convert_md_to_pdf(md_content, ticker)
-        headers = {"Content-Disposition": f'attachment; filename="{ticker}_professional_analyst_report_latest.pdf"'}
-        return StreamingResponse(BytesIO(pdf_bytes), media_type='application/pdf', headers=headers)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error downloading professional analyst report for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not read professional analyst report file: {str(e)}")
-
 # ------------- List job files -------------
 @app.get("/jobs/{job_id}/files")
 async def list_job_files(job_id: str):
+    """
+    List available files for a job. Now only checks for the 2 main download files.
+    """
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker not available")
 
     job = jobs[job_id]
-    base = job_root(job)
+    ticker = (job.get("ticker") or "").upper()
+    base = Path(job_root(job))
 
     try:
         files = {
-            "info_log": False,
-            "screening_report": False,
-            "screening_data": False,
-            "searched_articles_count": 0,
-            "filtered_articles_count": 0,
-            "financials_annual": False,
-            "peer_financials": False,
             "financial_model": False,
-            "financial_model_comparable": False,
-            "filtered_report": False,
-            "price_adjustment_explanation": False,
-            "technical_analysis": False,
-            "professional_analyst_report": False,
+            "professional_report": False,
         }
 
-        # info.log
-        try:
-            docker_client.containers.run(
-                "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/info.log",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["info_log"] = True
-        except:
-            pass
+        # Check for Excel financial model
+        xlsx_path = base / "models" / f"{ticker}_financial_model.xlsx"
+        files["financial_model"] = xlsx_path.exists()
 
-        # screening_report.md
-        try:
-            docker_client.containers.run(
-                "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/screened/screening_report.md",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["screening_report"] = True
-        except:
-            pass
-
-        # screening_data.json
-        try:
-            docker_client.containers.run(
-                "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/screened/screening_data.json",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["screening_data"] = True
-        except:
-            pass
-
-        # searched/*.md count
-        try:
-            searched_list = docker_client.containers.run(
-                "alpine:latest",
-                command=f"sh -c 'if [ -d {shlex.quote(base)}/searched ]; then ls {shlex.quote(base)}/searched/*.md 2>/dev/null | wc -l; else echo 0; fi'",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["searched_articles_count"] = int((searched_list.decode('utf-8').strip() or "0"))
-        except:
-            files["searched_articles_count"] = 0
-
-        # filtered/filtered_*.md count
-        try:
-            filtered_list = docker_client.containers.run(
-                "alpine:latest",
-                command=f"sh -c 'if [ -d {shlex.quote(base)}/filtered ]; then ls {shlex.quote(base)}/filtered/filtered_*.md 2>/dev/null | wc -l; else echo 0; fi'",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["filtered_articles_count"] = int((filtered_list.decode('utf-8').strip() or "0"))
-        except:
-            files["filtered_articles_count"] = 0
-
-        # financials/financials_annual_modeling_latest.json
-        try:
-            docker_client.containers.run(
-                "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/financials/financials_annual_modeling_latest.json",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["financials_annual"] = True
-        except:
-            pass
-
-        # models/financial_model_comprehensive_latest.xlsx
-        try:
-            docker_client.containers.run(
-                "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/models/financial_model_comprehensive_latest.xlsx",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["financial_model"] = True
-        except:
-            pass
-
-        try:
-            docker_client.containers.run(
-                "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/models/financial_model_comparable_latest.xlsx",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["financial_model_comparable"] = True
-        except:
-            pass
-
-        # filtered_report.md
-        try:
-            docker_client.containers.run(
-                "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/filtered/filtered_report.md",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["filtered_report"] = True
-        except:
-            pass
-
-        # models/price_adjustment_explanation_latest.md
-        try:
-            docker_client.containers.run(
-                "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/reports/price_adjustment_explanation_latest.md",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["price_adjustment_explanation"] = True
-        except:
-            pass
-
-        # reports/technical_analysis_latest.md
-        try:
-            docker_client.containers.run(
-                "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/reports/technical_analysis_latest.md",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["technical_analysis"] = True
-        except:
-            pass
-
-        # reports/professional_analyst_report_latest.md
-        try:
-            docker_client.containers.run(
-                "alpine:latest",
-                command=f"test -f {shlex.quote(base)}/reports/professional_analyst_report_latest.md",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["professional_analyst_report"] = True
-        except:
-            pass
-
-        # Check for peer financials
-        try:
-            peer_base = str(Path(base).parent)  # Go up one level
-            docker_client.containers.run(
-                "alpine:latest",
-                command=f"sh -c 'find {shlex.quote(peer_base)} -maxdepth 1 -type d -name \"temp_peer_*\" | head -20'",
-                volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
-                remove=True,
-                detach=False
-            )
-            files["peer_financials"] = True   
-        except Exception:
-            pass
+        # Check for professional analysis report
+        md_path = base / "reports" / f"{ticker}_Professional_Analysis_Report.md"
+        files["professional_report"] = md_path.exists()
 
         return {
             "job_id": job_id,
-            "ticker": job.get("ticker"),
+            "ticker": ticker,
             "files": files,
             "timestamp": datetime.now().isoformat()
         }
