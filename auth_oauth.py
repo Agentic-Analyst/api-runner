@@ -16,7 +16,7 @@ def _csv_env(name: str, default: str = ""):
     return [v.strip() for v in raw.split(",") if v.strip()]
 
 # ---------- Config ----------
-FRONTEND_ORIGINS = _csv_env("FRONTEND_ORIGIN", "http://localhost:3000")
+FRONTEND_ORIGINS = _csv_env("FRONTEND_ORIGIN")
 DEFAULT_FRONTEND = FRONTEND_ORIGINS[0]
 
 # When serving behind a proxy at a fixed public base (recommended in prod),

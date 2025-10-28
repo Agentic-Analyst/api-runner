@@ -132,7 +132,7 @@ def build_table(table_el, styles, page_width, left_margin, right_margin):
         head_cells = []
         for th in thead.find_all('th'):
             cell_html = to_paragraph_html(th)
-            head_cells.append(Paragraph(cell_html or '', styles['CustomBody']))
+            head_cells.append(Paragraph(cell_html or '', styles['TableHeader']))
         if head_cells:
             data.append(head_cells)
     
@@ -170,15 +170,15 @@ def build_table(table_el, styles, page_width, left_margin, right_margin):
         ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
         ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
         ('FONTSIZE', (0, 1), (-1, -1), 9.5),
-        ('TEXTCOLOR', (0, 1), (-1, -1), HexColor('#374151')),
+        ('TEXTCOLOR', (0, 1), (-1, -1), HexColor('#374151')),  # Body text only, starting from row 1
         ('ROWBACKGROUNDS', (0, 1), (-1, -1), [HexColor('#ffffff'), HexColor('#f8fafc')]),
     ]
     
-    # Header styling if we have one
+    # Header styling if we have one - applied AFTER body styles to ensure it takes precedence
     if repeat_rows:
         style_commands.extend([
             ('BACKGROUND', (0, 0), (-1, 0), HexColor('#1e3a8a')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), HexColor('#ffffff')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), HexColor('#ffffff')),  # White text for header
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
             ('FONTSIZE', (0, 0), (-1, 0), 10),
             ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
@@ -407,6 +407,16 @@ def create_custom_styles():
         fontName='Helvetica-Bold',
         alignment=TA_CENTER
     ))
+
+    styles.add(ParagraphStyle(
+        name='TableHeader',
+        parent=styles['BodyText'],
+        fontSize=10,
+        fontName='Helvetica-Bold',
+        textColor=HexColor('#ffffff'),
+        alignment=TA_CENTER,
+    ))
+
     
     return styles
 
@@ -686,3 +696,12 @@ def convert_md_to_pdf(md_content: str, ticker: str, *, base_url: str | None = No
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
+
+def main():
+    sample_md = open("NVDA_Professional_Analysis_Report_20251027_124329.md").read()
+    pdf_bytes = convert_md_to_pdf(sample_md, "NVDA")
+    with open("output_report.pdf", "wb") as f:
+        f.write(pdf_bytes)
+
+if __name__ == "__main__":
+    main()
