@@ -32,5 +32,7 @@ feedparser>=6.0.10    # RSS feed parsing
 google-search-results>=2.4.0  # SERP API integration
 nltk>=3.8             # Natural language processing
 
+pypdf>=3.10.0           # PDF manipulation library
+
 # vynn_core - News feed data layer for MongoDB/Redis
 git+https://github.com/Agentic-Analyst/vynn-core.git
