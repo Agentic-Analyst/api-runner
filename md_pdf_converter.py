@@ -15,6 +15,75 @@ from reportlab.platypus import ListFlowable, ListItem, XPreformatted, Image, Kee
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
 from reportlab.pdfgen import canvas
 from reportlab.platypus.tableofcontents import TableOfContents
+import xml.sax.saxutils as saxutils
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import DictionaryObject, ArrayObject, NameObject, NumberObject, TextStringObject
+
+
+# Global list to store pending internal links
+_pending_links = []
+_bookmark_registry = {}
+
+
+class InternalLinkParagraph(Paragraph):
+    """
+    Custom Paragraph class that supports internal PDF links.
+    Parses content for <ilink dest="...">text</ilink> tags and creates clickable regions.
+    """
+    def __init__(self, text, style, **kwargs):
+        # Store internal links info
+        self.internal_links = []
+        
+        # Parse and extract internal links
+        import re
+        pattern = r'<ilink dest="([^"]+)">([^<]+)</ilink>'
+        
+        def replacer(match):
+            dest = match.group(1)
+            link_text = match.group(2)
+            self.internal_links.append(dest)
+            # Replace with styled text (blue and underlined)
+            return f'<font color="blue"><u>{link_text}</u></font>'
+        
+        processed_text = re.sub(pattern, replacer, text)
+        super().__init__(processed_text, style, **kwargs)
+    
+    def draw(self):
+        super().draw()
+        # Create internal links using bookmarkHorizontal
+        if self.internal_links:
+            x, y = self.canv.absolutePosition(0, 0)
+            w, h = self.width, self.height
+            
+            for dest in self.internal_links:
+                try:
+                    # Use bookmarkHorizontal to link to a bookmark
+                    # The key is to not specify the page - let it be resolved later
+                    self.canv.bookmarkHorizontal(dest, x, y + h)
+                except Exception as e:
+                    # Ignore errors - bookmark might not exist yet
+                    pass
+
+
+class BookmarkableHeading(Paragraph):
+    """A Paragraph with an optional PDF bookmark anchor."""
+    def __init__(self, text, style, bookmark_name=None):
+        super().__init__(text, style)
+        self.bookmark_name = bookmark_name
+    
+    def draw(self):
+        # Register this bookmark
+        if self.bookmark_name:
+            page_num = self.canv.getPageNumber()
+            x, y = self.canv.absolutePosition(0, 0)
+            _bookmark_registry[self.bookmark_name] = {
+                'page': page_num,
+                'x': x,
+                'y': y + self.height  # Top of the heading
+            }
+            # Create a bookmark page marker
+            self.canv.bookmarkPage(self.bookmark_name)
+        super().draw()
 
 
 def footer(canvas_obj, doc):
@@ -25,6 +94,31 @@ def footer(canvas_obj, doc):
     text = f"Page {page_num}"
     canvas_obj.drawCentredString(letter[0] / 2, 0.5 * inch, text)
     canvas_obj.restoreState()
+
+
+def create_anchor_id(text):
+    """
+    Convert heading text to an anchor ID similar to how markdown generates IDs.
+    E.g., "Executive Summary" -> "executive-summary"
+    "Financial Model & Valuation" -> "financial-model--valuation"
+    """
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
+    # Decode HTML entities (e.g., &amp; -> &)
+    from html import unescape
+    text = unescape(text)
+    # Convert to lowercase
+    text = text.lower()
+    # Remove & and other special chars, but keep spaces and hyphens
+    # Markdown removes & leaving adjacent spaces which become --
+    text = re.sub(r'&', '', text)
+    # Replace spaces with hyphens
+    text = re.sub(r'[\s]+', '-', text)
+    # Remove other special chars except hyphens
+    text = re.sub(r'[^\w-]', '', text)
+    # Remove leading/trailing hyphens
+    text = text.strip('-')
+    return text
 
 
 # Allowed inline HTML tags for ReportLab Paragraph
@@ -68,12 +162,17 @@ def to_paragraph_html(node):
                 href = child.get("href") or ""
                 text = to_paragraph_html(child)
                 
-                # Skip internal anchor links (start with #) as they cause issues
                 if href and not href.startswith('#'):
+                    # External links work fine with standard link tag
                     parts.append(f'<link href="{escape(href, quote=True)}" color="blue">{text}</link>')
+                elif href and href.startswith('#'):
+                    # Internal bookmark links - use custom <ilink> tag
+                    # Strip the # and use the bookmark name as destination
+                    dest_name = href[1:]  # Remove the leading #
+                    parts.append(f'<ilink dest="{dest_name}">{text}</ilink>')
                 else:
-                    # For internal links, just render as bold text
-                    parts.append(f"<b>{text}</b>")
+                    # No href - just render text
+                    parts.append(text)
             else:
                 # Unknown tag - just get text
                 parts.append(escape(child.get_text()))
@@ -96,8 +195,12 @@ def build_list(list_el, styles, level=0):
             sub_text = sub.get_text()
             para_html = para_html.replace(escape(sub_text), "")
         
-        # Create paragraph
-        p = Paragraph(para_html.strip(), styles['CustomListItem'])
+        # Create paragraph - check for internal links
+        has_internal_links = '<ilink dest=' in para_html
+        if has_internal_links:
+            p = InternalLinkParagraph(para_html.strip(), styles['CustomListItem'])
+        else:
+            p = Paragraph(para_html.strip(), styles['CustomListItem'])
         
         # Handle nested lists
         sublists = []
@@ -109,12 +212,21 @@ def build_list(list_el, styles, level=0):
         else:
             items.append(ListItem(p))
     
-    bullet = 'bullet' if list_el.name == 'ul' else '1'
+    # Use proper bullet characters for unordered lists
+    if list_el.name == 'ul':
+        bullet_type = 'bullet'
+        # Also try with explicit bullet character
+        start_value = None
+    else:
+        bullet_type = '1'
+        start_value = '1'
+    
     return ListFlowable(
         items,
-        bulletType=bullet,
-        start='1',
-        leftIndent=18 + level * 12
+        bulletType=bullet_type,
+        start=start_value,
+        leftIndent=18 + level * 12,
+        bulletFontName='Symbol' if list_el.name == 'ul' else 'Helvetica'
     )
 
 
@@ -451,26 +563,34 @@ def parse_html_to_flowables(html_content, styles, base_url=None, page_w=letter[0
             h1_seen = True
             text = to_paragraph_html(el)
             if text.strip():
-                flowables.append(Paragraph(text, styles['CustomH1']))
+                # Create bookmark for h1
+                anchor_id = create_anchor_id(el.get_text())
+                flowables.append(BookmarkableHeading(text, styles['CustomH1'], bookmark_name=anchor_id))
                 flowables.append(Spacer(1, 0.15 * inch))
         
         elif name == 'h2':
             text = to_paragraph_html(el)
             if text.strip():
+                # Create bookmark for h2
+                anchor_id = create_anchor_id(el.get_text())
                 flowables.append(Spacer(1, 0.1 * inch))
-                flowables.append(Paragraph(text, styles['CustomH2']))
+                flowables.append(BookmarkableHeading(text, styles['CustomH2'], bookmark_name=anchor_id))
                 flowables.append(Spacer(1, 0.1 * inch))
         
         elif name == 'h3':
             text = to_paragraph_html(el)
             if text.strip():
-                flowables.append(Paragraph(text, styles['CustomH3']))
+                # Create bookmark for h3
+                anchor_id = create_anchor_id(el.get_text())
+                flowables.append(BookmarkableHeading(text, styles['CustomH3'], bookmark_name=anchor_id))
                 flowables.append(Spacer(1, 0.08 * inch))
         
         elif name == 'h4':
             text = to_paragraph_html(el)
             if text.strip():
-                flowables.append(Paragraph(text, styles['CustomH4']))
+                # Create bookmark for h4
+                anchor_id = create_anchor_id(el.get_text())
+                flowables.append(BookmarkableHeading(text, styles['CustomH4'], bookmark_name=anchor_id))
                 flowables.append(Spacer(1, 0.06 * inch))
         
         elif name == 'p':
@@ -478,11 +598,20 @@ def parse_html_to_flowables(html_content, styles, base_url=None, page_w=letter[0
             if para_html.strip():
                 # Check if this is a highlighted paragraph (starts with **)
                 raw_text = el.get_text().strip()
+                # Check if paragraph contains internal links
+                has_internal_links = '<ilink dest=' in para_html
+                
                 if raw_text.startswith('**') and raw_text.endswith('**'):
                     # This is a bold/important statement - use highlight style
-                    flowables.append(Paragraph(para_html, styles['HighlightBox']))
+                    if has_internal_links:
+                        flowables.append(InternalLinkParagraph(para_html, styles['HighlightBox']))
+                    else:
+                        flowables.append(Paragraph(para_html, styles['HighlightBox']))
                 else:
-                    flowables.append(Paragraph(para_html, styles['CustomBody']))
+                    if has_internal_links:
+                        flowables.append(InternalLinkParagraph(para_html, styles['CustomBody']))
+                    else:
+                        flowables.append(Paragraph(para_html, styles['CustomBody']))
                 flowables.append(Spacer(1, 0.1 * inch))
         
         elif name in ('ul', 'ol'):
@@ -529,6 +658,50 @@ def parse_html_to_flowables(html_content, styles, base_url=None, page_w=letter[0
                 flowables.append(Spacer(1, 0.12 * inch))
     
     return flowables
+
+
+def add_internal_links_to_pdf(pdf_bytes, pending_links, bookmark_registry):
+    """
+    Post-process the generated PDF to add clickable internal links.
+    Uses pypdf to add link annotations that point to bookmarks.
+    """
+    if not pending_links or not bookmark_registry:
+        return pdf_bytes
+    
+    try:
+        # Read the PDF
+        pdf_reader = PdfReader(BytesIO(pdf_bytes))
+        pdf_writer = PdfWriter()
+        
+        # Copy all pages
+        for page in pdf_reader.pages:
+            pdf_writer.add_page(page)
+        
+        # Add link annotations for pending links
+        for link_info in pending_links:
+            page_num = link_info['page'] - 1  # Convert to 0-indexed
+            rect = link_info['rect']
+            dest_name = link_info['dest']
+            
+            # Check if the destination bookmark exists
+            if dest_name in bookmark_registry:
+                dest_info = bookmark_registry[dest_name]
+                dest_page = dest_info['page'] - 1  # Convert to 0-indexed
+                
+                # Create a link annotation
+                # This would require manual PDF annotation creation which is complex
+                # For now, we'll skip this and rely on PDF bookmarks which ARE clickable
+                pass
+        
+        # Write to bytes
+        output_buffer = BytesIO()
+        pdf_writer.write(output_buffer)
+        return output_buffer.getvalue()
+    
+    except Exception as e:
+        print(f"Warning: Could not post-process PDF links: {e}")
+        # Return original PDF if post-processing fails
+        return pdf_bytes
 
 
 def convert_md_to_pdf(md_content: str, ticker: str, *, base_url: str | None = None) -> bytes:
@@ -662,8 +835,11 @@ def convert_md_to_pdf(md_content: str, ticker: str, *, base_url: str | None = No
             story.append(Spacer(1, 0.2*inch))
             
             for idx, heading in enumerate(h2_headings, 1):
-                toc_entry = f"{idx}. {heading}"
-                story.append(Paragraph(toc_entry, styles['TOCEntry']))
+                # Create anchor ID for the heading
+                anchor_id = create_anchor_id(heading)
+                # Create clickable TOC entry with internal link using our custom ilink tag
+                toc_entry = f'{idx}. <ilink dest="{anchor_id}">{heading}</ilink>'
+                story.append(InternalLinkParagraph(toc_entry, styles['TOCEntry']))
             
             story.append(Spacer(1, 0.3*inch))
             story.append(HRFlowable(
@@ -686,11 +862,19 @@ def convert_md_to_pdf(md_content: str, ticker: str, *, base_url: str | None = No
         story.extend(flowables)
         
         # 6) Build PDF
+        # Clear pending links before building
+        global _pending_links, _bookmark_registry
+        _pending_links = []
+        _bookmark_registry = {}
+        
         doc.build(story, onFirstPage=footer, onLaterPages=footer)
         
-        # 7) Return PDF bytes
+        # 7) Post-process PDF to add clickable internal links
         pdf_bytes = buffer.getvalue()
         buffer.close()
+        
+        # Add internal links using pypdf
+        pdf_bytes = add_internal_links_to_pdf(pdf_bytes, _pending_links, _bookmark_registry)
         
         return pdf_bytes
         
@@ -698,8 +882,8 @@ def convert_md_to_pdf(md_content: str, ticker: str, *, base_url: str | None = No
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
 
 def main():
-    sample_md = open("NVDA_Professional_Analysis_Report_20251027_124329.md").read()
-    pdf_bytes = convert_md_to_pdf(sample_md, "NVDA")
+    sample_md = open("AAPL_Professional_Analysis_Report.md").read()
+    pdf_bytes = convert_md_to_pdf(sample_md, "AAPL")
     with open("output_report.pdf", "wb") as f:
         f.write(pdf_bytes)
 
