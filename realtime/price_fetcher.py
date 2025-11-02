@@ -120,6 +120,9 @@ class StockPriceFetcher:
             currency=info.get('currency', 'USD'),
             last_updated=datetime.now(),
             is_market_open=self._is_market_open(info),
+            # Company classification
+            sector=info.get('sector'),
+            industry=info.get('industry'),
             # Additional market data
             bid=info.get('bid'),
             ask=info.get('ask'),
@@ -361,6 +364,9 @@ class PriceManager:
                                 volume=price.volume,
                                 market_cap=price.market_cap,
                                 timestamp=price.last_updated.isoformat(),
+                                # Company classification
+                                sector=price.sector,
+                                industry=price.industry,
                                 # Additional market data
                                 bid=price.bid,
                                 ask=price.ask,

@@ -12,6 +12,7 @@ authlib>=1.3
 python-multipart>=0.0.9
 email-validator
 openai>=1.30.0
+pytz>=2024.1           # Timezone handling for daily reports scheduler
 
 # MongoDB dependencies for user management APIs
 motor>=3.5.0          # Async MongoDB driver for FastAPI (updated for compatibility)
@@ -35,4 +36,5 @@ nltk>=3.8             # Natural language processing
 pypdf>=3.10.0           # PDF manipulation library
 
 # vynn_core - News feed data layer for MongoDB/Redis
-git+https://github.com/Agentic-Analyst/vynn-core.git
+vynn-core @ git+https://github.com/Agentic-Analyst/vynn-core.git@a84098d41d1fdeebd437fb698f20ac683ccc1e3c
+

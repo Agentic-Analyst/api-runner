@@ -41,7 +41,25 @@ import shlex, time, io, zipfile, hashlib
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware import Middleware
 from agents.gateway_agent import GatewayAgent
-from auth_oauth import router as oauth_router  # noqa: E402
+from news_feed.news_manager import NewsManager
+
+# Load environment variables FIRST before any imports that use them
+from dotenv import load_dotenv
+load_dotenv()
+
+# Import shared configuration
+import config
+from config import (
+    BACKEND_IMAGE, DATA_VOLUME,
+    SERPAPI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY,
+    MONGO_URI, MONGO_DB,
+    csv_env
+)
+
+# Auth routers (imported after .env is loaded)
+from auth_oauth import router as oauth_router
+from auth_code_login import router as code_router
+
 from md_pdf_converter import convert_md_to_pdf
 
 # Real-time stock price system
@@ -58,11 +76,9 @@ from news_feed.api import init_news_manager, close_news_manager
 from news_feed.news_auto_updater import NewsUpdateManager, NewsUpdateConfig
 from news_feed.news_websocket import init_news_websocket_manager, get_news_websocket_manager
 
-from dotenv import load_dotenv
-load_dotenv()
-
-# Email-code login router
-from auth_code_login import router as code_router  # <— ensure this file is present
+# Daily reports system
+from reports.daily import daily_reports_router, initialize_scheduler, shutdown_scheduler
+from reports.daily.api import set_docker_client
 
 # Tunables
 POLL_INTERVAL_SEC = 0.75
@@ -79,21 +95,15 @@ websocket_manager = None
 news_auto_updater: Optional[NewsUpdateManager] = None
 news_websocket_manager = None
 
-# --- Env / App init ---
-def _csv_env(name: str, default: str = "") -> List[str]:
-    raw = os.getenv(name, default)
-    vals = [v.strip() for v in raw.split(",") if v.strip()]
-    return vals
-
-# --- Env ---
-FRONTEND_ORIGINS = _csv_env("FRONTEND_ORIGIN")
-ROOT_PATH = os.getenv("ROOT_PATH")
-SESSION_SECRET = os.getenv("SESSION_SECRET")
-SESSION_HTTPS_ONLY = os.getenv("SESSION_HTTPS_ONLY", "false").lower() == "true"
-SESSION_STORE_COOKIE = os.getenv("SESSION_STORE_COOKIE")
+# Frontend origins from config
+FRONTEND_ORIGINS = csv_env("FRONTEND_ORIGIN")
+ROOT_PATH = config.ROOT_PATH
+SESSION_SECRET = config.SESSION_SECRET
+SESSION_HTTPS_ONLY = config.SESSION_HTTPS_ONLY
+SESSION_STORE_COOKIE = config.SESSION_STORE_COOKIE
 
 # SameSite configuration
-SESSION_SAMESITE = os.getenv("SESSION_SAMESITE", "lax").lower()
+SESSION_SAMESITE = config.SESSION_SAMESITE
 if SESSION_SAMESITE not in {"lax", "none", "strict"}:
     SESSION_SAMESITE = "lax"
 if SESSION_SAMESITE == "none" and not SESSION_HTTPS_ONLY:
@@ -133,6 +143,7 @@ app.include_router(oauth_router)
 app.include_router(code_router)
 app.include_router(stock_router)
 app.include_router(news_router)
+app.include_router(daily_reports_router)
 
 # Health endpoint (useful for container probes)
 @app.get("/healthz")
@@ -142,15 +153,6 @@ def healthz():
 # Global variables
 docker_client = None
 jobs: Dict[str, Dict] = {}
-
-# Configuration from environment variables
-BACKEND_IMAGE = os.getenv("BACKEND_IMAGE", "stock-analyst:latest")
-DATA_VOLUME = os.getenv("DATA_VOLUME", "stockdata")
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB = os.getenv("MONGO_DB")
 
 # --------- Utilities for new layout ---------
 def job_root(job: Dict) -> str:
@@ -580,7 +582,7 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
             "DATA_PATH": "/data",
         }
 
-        cmd = ["--ticker", ticker, "--company", company, "--email", email, "--timestamp", timestamp]
+        cmd = ["--ticker", ticker, "--email", email, "--timestamp", timestamp]
         if llm:
             cmd.extend(["--llm", llm])
         if pipeline:
@@ -766,6 +768,8 @@ async def startup_event():
         logger.warning("⚠️ Docker not available - running in limited mode")
     else:
         ensure_volume_exists()
+        # Set docker client for daily reports module
+        set_docker_client(docker_client)
 
     if not SERPAPI_API_KEY:
         logger.warning("⚠️ SERPAPI_API_KEY not set")
@@ -780,50 +784,59 @@ async def startup_event():
     else:
         logger.info("✅ ANTHROPIC_API_KEY configured")
 
-    # Initialize news feed system
+    # Initialize news feed system (REQUIRED for news WebSocket to work)
     news_ready = await init_news_manager()
     if news_ready:
         logger.info("✅ News feed system initialized successfully")
         
-        # Initialize news auto-updater
+        # Initialize news WebSocket manager (WITHOUT auto-updater)
         try:
-            logger.info("🚀 Starting automatic news update system...")
+            news_manager = NewsManager()
+            await news_manager.initialize()
             
-            # Create optimized news auto-updater with 30-minute intervals and API rate limiting
-            news_config = NewsUpdateConfig(
-                update_interval=7200,  # 2 hours in seconds (reduced from 5 min)
-                max_tickers_per_batch=2,  # Reduced from 10 for API limits
-                days_back=1,  # Only check last 1 day (reduced from 7)
-                articles_limit=10,  # Reduced from 20
-                timeout_seconds=180,
-                force_refresh=False,
-                min_update_interval=3600,  # Minimum 1 hour between updates per ticker
-                max_api_calls_per_hour=20  # SerpAPI rate limiting
-            )
-            news_auto_updater = NewsUpdateManager(news_config)
+            # Initialize WebSocket manager WITHOUT auto-updater (passing None)
+            news_websocket_manager = init_news_websocket_manager(news_manager, auto_updater=None)
             
-            # Initialize and start auto-updater
-            auto_update_ready = await news_auto_updater.initialize()
-            if auto_update_ready:
-                await news_auto_updater.start()
-                logger.info("✅ News auto-updater started - updating every 30 minutes with smart rate limiting")
-                
-                # Initialize news WebSocket manager with auto-updater integration
-                from news_feed.news_manager import NewsManager
-                news_manager = NewsManager()
-                await news_manager.initialize()
-                
-                news_websocket_manager = init_news_websocket_manager(news_manager, news_auto_updater)
-                news_websocket_manager.set_auto_updater(news_auto_updater)
-                
-                logger.info("✅ News WebSocket manager initialized with auto-updates")
-                logger.info("📡 News WebSocket endpoint available at /api/news/ws")
-            else:
-                logger.warning("⚠️ News auto-updater failed to initialize")
-                
+            logger.info("✅ News WebSocket manager initialized (manual updates only)")
+            logger.info("📡 News WebSocket endpoint available at /api/news/ws")
         except Exception as e:
-            logger.error(f"❌ Failed to start news auto-updater: {e}")
-            logger.warning("⚠️ Automatic news updates will be unavailable")
+            logger.error(f"❌ Failed to initialize news WebSocket manager: {e}")
+            logger.warning("⚠️ News WebSocket will be unavailable")
+        
+        # OPTIONAL: Initialize news auto-updater (currently disabled)
+        # Uncomment this section if you want automatic background news updates
+        # try:
+        #     logger.info("🚀 Starting automatic news update system...")
+        #     
+        #     # Create optimized news auto-updater with 30-minute intervals and API rate limiting
+        #     news_config = NewsUpdateConfig(
+        #         update_interval=7200,  # 2 hours in seconds (reduced from 5 min)
+        #         max_tickers_per_batch=2,  # Reduced from 10 for API limits
+        #         days_back=1,  # Only check last 1 day (reduced from 7)
+        #         articles_limit=10,  # Reduced from 20
+        #         timeout_seconds=180,
+        #         force_refresh=False,
+        #         min_update_interval=3600,  # Minimum 1 hour between updates per ticker
+        #         max_api_calls_per_hour=20  # SerpAPI rate limiting
+        #     )
+        #     news_auto_updater = NewsUpdateManager(news_config)
+        #     
+        #     # Initialize and start auto-updater
+        #     auto_update_ready = await news_auto_updater.initialize()
+        #     if auto_update_ready:
+        #         await news_auto_updater.start()
+        #         logger.info("✅ News auto-updater started - updating every 30 minutes with smart rate limiting")
+        #         
+        #         # Connect auto-updater to WebSocket manager
+        #         if news_websocket_manager:
+        #             news_websocket_manager.set_auto_updater(news_auto_updater)
+        #             logger.info("✅ Auto-updater connected to WebSocket manager")
+        #     else:
+        #         logger.warning("⚠️ News auto-updater failed to initialize")
+        #         
+        # except Exception as e:
+        #     logger.error(f"❌ Failed to start news auto-updater: {e}")
+        #     logger.warning("⚠️ Automatic news updates will be unavailable")
     else:
         logger.warning("⚠️ News feed system not available")
 
@@ -857,6 +870,18 @@ async def startup_event():
         logger.error(f"❌ Failed to start real-time system: {e}")
         logger.warning("⚠️ Real-time features will be unavailable")
 
+    # # Initialize daily reports scheduler
+    # try:
+    #     logger.info("🚀 Starting daily reports scheduler...")
+    #     scheduler_ready = await initialize_scheduler()
+    #     if scheduler_ready:
+    #         logger.info("✅ Daily reports scheduler started - auto-generates reports at 8:30 AM ET (Mon-Fri)")
+    #     else:
+    #         logger.warning("⚠️ Daily reports scheduler failed to initialize")
+    # except Exception as e:
+    #     logger.error(f"❌ Failed to start daily reports scheduler: {e}")
+    #     logger.warning("⚠️ Automatic daily report generation will be unavailable")
+
     logger.info("✅ API Runner started successfully")
 
 @app.on_event("shutdown")
@@ -883,6 +908,14 @@ async def shutdown_event():
             logger.info("✅ News auto-updater stopped")
     except Exception as e:
         logger.error(f"❌ Error stopping news auto-updater: {e}")
+    
+    # Shutdown daily reports scheduler
+    try:
+        logger.info("🛑 Stopping daily reports scheduler...")
+        await shutdown_scheduler()
+        logger.info("✅ Daily reports scheduler stopped")
+    except Exception as e:
+        logger.error(f"❌ Error stopping daily reports scheduler: {e}")
     
     # Shutdown news feed system
     try:

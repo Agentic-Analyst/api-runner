@@ -308,7 +308,6 @@ class NewsManager:
             # Command to run search-news pipeline
             cmd = [
                 "--ticker", ticker,
-                "--company", company,
                 "--email", email,
                 "--timestamp", datetime.now().isoformat(),
                 "--pipeline", "search-news",

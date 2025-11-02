@@ -208,11 +208,10 @@ class GatewayAgent:
             True if all arguments are valid, False otherwise.
         """
         ticker = args.get("ticker")
-        company = args.get("company_name")
         pipeline = args.get("pipeline", "comprehensive")
         
-        if not ticker or not company:
-            self.logger.warning("Ticker and/or company name missing from extraction")
+        if not ticker:
+            self.logger.warning("Ticker is missing from extraction")
             return False
         
         # Validate pipeline value

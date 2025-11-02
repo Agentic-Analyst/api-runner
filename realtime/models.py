@@ -29,6 +29,10 @@ class StockPrice(BaseModel):
     last_updated: datetime = Field(default_factory=datetime.now, description="Last update timestamp")
     is_market_open: Optional[bool] = Field(None, description="Whether market is currently open")
     
+    # Company classification
+    sector: Optional[str] = Field(None, description="Company sector (e.g., Technology, Healthcare)")
+    industry: Optional[str] = Field(None, description="Company industry (e.g., Software, Pharmaceuticals)")
+    
     # Additional market data for enhanced frontend display
     bid: Optional[float] = Field(None, description="Bid price")
     ask: Optional[float] = Field(None, description="Ask price")
@@ -54,6 +58,10 @@ class PriceUpdate(BaseModel):
     volume: Optional[int] = Field(None, description="Current day volume")
     market_cap: Optional[int] = Field(None, description="Market capitalization")
     timestamp: str = Field(..., description="Last update time")
+    
+    # Company classification
+    sector: Optional[str] = Field(None, description="Company sector (e.g., Technology, Healthcare)")
+    industry: Optional[str] = Field(None, description="Company industry (e.g., Software, Pharmaceuticals)")
     
     # Additional market data for enhanced frontend display
     bid: Optional[float] = Field(None, description="Bid price")

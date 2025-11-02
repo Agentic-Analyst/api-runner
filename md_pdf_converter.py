@@ -880,12 +880,3 @@ def convert_md_to_pdf(md_content: str, ticker: str, *, base_url: str | None = No
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
-
-def main():
-    sample_md = open("AAPL_Professional_Analysis_Report.md").read()
-    pdf_bytes = convert_md_to_pdf(sample_md, "AAPL")
-    with open("output_report.pdf", "wb") as f:
-        f.write(pdf_bytes)
-
-if __name__ == "__main__":
-    main()

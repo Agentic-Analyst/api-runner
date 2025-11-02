@@ -17,10 +17,10 @@ Create a short, Chrome-like search query for latest news based on user's intenti
 **User Request:** {request}
 
 **Required Output:**
-- ticker: Stock symbol (e.g., "AAPL")
-- company_name: Full company name (e.g., "Apple Inc")  
-- pipeline: One of the 6 pipelines above
-- query: Short search query (only for comprehensive, search-news, screen-news, news-to-price. If the pipeline is financial-statements or financial-model, simply return the above 3)
+- ticker: Stock symbol (e.g., "AAPL") - REQUIRED
+- company_name: Full company name (e.g., "Apple Inc") - OPTIONAL (for display purposes only)
+- pipeline: One of the 6 pipelines above - REQUIRED
+- query: Short search query - REQUIRED for comprehensive, search-news, screen-news, news-to-price
 
 **Pipeline Selection Logic:**
 - Full/complete/comprehensive analysis → "comprehensive"
