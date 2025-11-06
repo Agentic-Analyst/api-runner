@@ -877,9 +877,9 @@ async def run_chat_job(
                 )
         except asyncio.TimeoutError:
             logger.warning(f"⚠️ Ticker identification timeout for job {job_id}, continuing anyway...")
-            # If we couldn't identify ticker, keep "chat" as ticker
+            # If we couldn't identify ticker, keep "pending" as ticker
             if not ticker_identified:
-                logger.info(f"Using fallback ticker 'chat' for job {job_id}")
+                logger.info(f"Ticker not identified for job {job_id}, keeping 'pending' status")
         except Exception as e:
             logger.error(f"Error during ticker extraction: {e}")
 
@@ -887,7 +887,7 @@ async def run_chat_job(
         if ticker_identified and identified_ticker:
             logger.info(f"✅ Ticker identified: {identified_ticker}, starting log monitoring...")
         else:
-            logger.warning(f"⚠️ Ticker not identified, using 'chat' as fallback")
+            logger.warning(f"⚠️ Ticker not identified, keeping 'pending' status")
         
         log_task = asyncio.create_task(monitor_info_log(job_id, container))
 
@@ -1378,7 +1378,7 @@ async def start_chat(chat_req: ChatRequest, background_tasks: BackgroundTasks):
 
         jobs[job_id] = {
             "job_id": job_id,
-            "ticker": "chat",  # Not applicable for chat
+            "ticker": "pending",  # Will be updated once backend identifies ticker
             "company": None,  # Not required for chat
             "user_email": user_email,
             "timestamp": request_timestamp,
@@ -1402,7 +1402,7 @@ async def start_chat(chat_req: ChatRequest, background_tasks: BackgroundTasks):
 
         return JobResponse(
             job_id=job_id, 
-            ticker="chat",  # Not applicable for chat
+            ticker="pending",  # Will be updated to actual ticker (e.g., "NVDA") once identified
             status="pending", 
             message=f"Chat session started"
         )
