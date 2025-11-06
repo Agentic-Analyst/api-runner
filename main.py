@@ -834,7 +834,8 @@ async def run_chat_job(
         ticker_identified = False
         identified_ticker = None
         
-        async def extract_ticker_from_logs():
+        def extract_ticker_from_logs():
+            """Extract ticker from container logs (synchronous function for executor)"""
             nonlocal ticker_identified, identified_ticker
             try:
                 # Stream container logs to extract ticker
@@ -893,7 +894,8 @@ async def run_chat_job(
 
         try:
             def wait_for_container():
-                return container.wait(timeout=1800)
+                result = container.wait(timeout=1800)
+                return result
             
             # Monitor for stop requests while container is running
             stop_check_task = None
@@ -919,7 +921,7 @@ async def run_chat_job(
             
             try:
                 with concurrent.futures.ThreadPoolExecutor() as executor:
-                    await loop.run_in_executor(executor, wait_for_container())
+                    await loop.run_in_executor(executor, wait_for_container)
             finally:
                 if stop_check_task:
                     stop_check_task.cancel()
@@ -1539,15 +1541,22 @@ async def get_job_logs_stream(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = jobs[job_id]
-    ticker = (job.get('ticker') or '').upper()
     container_id = job.get('container_id')
 
     if not docker_client:
         raise HTTPException(status_code=503, detail="Docker not available")
 
-    base = job_root(job)  # /data/<email>/<TICKER>/<timestamp>
-
     async def log_generator():
+        # Get ticker dynamically - it may be updated during streaming (e.g., chat jobs)
+        def get_current_ticker():
+            return (jobs[job_id].get('ticker') or '').upper()
+        
+        # Get base path dynamically as ticker may change
+        def get_current_base():
+            return job_root(jobs[job_id])
+        
+        ticker = get_current_ticker()
+        base = get_current_base()
         last_size = 0
         container = None
         decoder = codecs.getincrementaldecoder('utf-8')()
@@ -1568,16 +1577,16 @@ async def get_job_logs_stream(job_id: str):
                 pass
             return f"event: {event_type}\ndata: {payload}\n\n"
 
-        yield sse("connection", f"Connected to log stream for {ticker}")
+        yield sse("connection", f"Connected to log stream for {get_current_ticker()}")
 
         if container_id:
             try:
                 c = docker_client.containers.get(container_id)
                 c.reload()
                 container = c
-                logger.info(f"Found analysis container for {ticker}: {container_id}")
+                logger.info(f"Found analysis container for {get_current_ticker()}: {container_id}")
             except docker.errors.NotFound:
-                logger.info(f"Analysis container not found for {ticker}, using volume fallback")
+                logger.info(f"Analysis container not found for {get_current_ticker()}, using volume fallback")
                 container = None
 
         async def probe_size_and_read_from_container(start_byte: int):
@@ -1585,7 +1594,8 @@ async def get_job_logs_stream(job_id: str):
                 return 0, b""
             try:
                 container.reload()
-                path = f"{base}/info.log"
+                current_base = get_current_base()  # Get fresh path in case ticker updated
+                path = f"{current_base}/info.log"
                 size_res = container.exec_run(
                     f"sh -lc 'if [ -f {shlex.quote(path)} ]; then wc -c < {shlex.quote(path)}; else echo 0; fi'"
                 )
@@ -1608,7 +1618,8 @@ async def get_job_logs_stream(job_id: str):
 
         async def probe_size_and_read_from_volume(start_byte: int):
             try:
-                path = f"{base}/info.log"
+                current_base = get_current_base()  # Get fresh path in case ticker updated
+                path = f"{current_base}/info.log"
                 size_out = docker_client.containers.run(
                     "alpine:latest",
                     command=f"sh -lc 'if [ -f {shlex.quote(path)} ]; then wc -c < {shlex.quote(path)}; else echo 0; fi'",
