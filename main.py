@@ -218,6 +218,13 @@ class JobResponse(BaseModel):
     status: str
     message: str
 
+class ChatRequest(BaseModel):
+    """Chat request model for conversational AI analysis"""
+    email: str = Field(..., description="User email for data organization")
+    timestamp: str = Field(..., description="Timestamp for the chat session")
+    user_prompt: str = Field(..., description="User's chat message/question")
+    session_id: Optional[str] = Field(default=None, description="Session ID for continuing conversation (optional)")
+
 class JobStatus(BaseModel):
     job_id: str
     ticker: str
@@ -757,6 +764,232 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
             jobs[job_id]["status"] = "failed"
             jobs[job_id]["error"] = str(e)
 
+# ------------- Chat job runner -------------
+async def run_chat_job(
+    job_id: str,
+    email: str,
+    timestamp: str,
+    user_prompt: str,
+    session_id: Optional[str] = None
+):
+    """
+    Run chat job in Docker container with the chat pipeline.
+    
+    Args:
+        job_id: Unique job identifier
+        email: User email
+        timestamp: ISO timestamp
+        user_prompt: User's chat message/question
+        session_id: Optional session ID for continuing conversation
+    """
+    if not docker_client:
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"] = "Docker client not available"
+        return
+
+    try:
+        jobs[job_id]["status"] = "running"
+        jobs[job_id]["progress"] = "Starting chat session..."
+        jobs[job_id]["recent_logs"] = []
+
+        env_vars = {
+            "SERPAPI_API_KEY": SERPAPI_API_KEY,
+            "OPENAI_API_KEY": OPENAI_API_KEY,
+            "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+            "MONGO_URI": MONGO_URI,
+            "MONGO_DB": MONGO_DB,
+            "DATA_PATH": "/data",
+        }
+
+        # Build command for chat pipeline (4 required args: email, timestamp, pipeline, user-prompt, session-id)
+        cmd = [
+            "--email", email,
+            "--timestamp", timestamp,
+            "--pipeline", "chat",
+            "--user-prompt", user_prompt
+        ]
+        
+        # Add optional session-id if provided
+        if session_id:
+            cmd.extend(["--session-id", session_id])
+
+        logger.info(f"🚀 Starting chat session with command: {cmd}")
+        jobs[job_id]["progress"] = f"Running chat session..."
+
+        container = docker_client.containers.run(
+            BACKEND_IMAGE,
+            command=cmd,
+            environment=env_vars,
+            volumes={DATA_VOLUME: {'bind': '/data', 'mode': 'rw'}},
+            detach=True,
+            remove=False,
+            name=f"chat-{job_id}"
+        )
+
+        jobs[job_id]["container_id"] = container.id
+        jobs[job_id]["progress"] = "Waiting for ticker identification..."
+
+        # Listen to container stdout to extract ticker
+        # The backend prints: "[SUPERVISOR] ✅ Identified ticker: {ticker}"
+        ticker_identified = False
+        identified_ticker = None
+        
+        async def extract_ticker_from_logs():
+            nonlocal ticker_identified, identified_ticker
+            try:
+                # Stream container logs to extract ticker
+                log_stream = container.logs(stream=True, follow=True)
+                for log_line in log_stream:
+                    try:
+                        line = log_line.decode('utf-8').strip()
+                        logger.info(f"[CHAT CONTAINER] {line}")
+                        
+                        # Look for ticker identification line
+                        if "[SUPERVISOR] ✅ Identified ticker:" in line:
+                            # Extract ticker: "[SUPERVISOR] ✅ Identified ticker: NVDA"
+                            parts = line.split("Identified ticker:")
+                            if len(parts) > 1:
+                                identified_ticker = parts[1].strip().upper()
+                                ticker_identified = True
+                                logger.info(f"🎯 Extracted ticker from chat: {identified_ticker}")
+                                
+                                # Update job with identified ticker
+                                jobs[job_id]["ticker"] = identified_ticker
+                                jobs[job_id]["progress"] = f"Analyzing {identified_ticker}..."
+                                
+                                # Break after finding ticker
+                                break
+                    except Exception as decode_error:
+                        logger.warning(f"Error decoding log line: {decode_error}")
+                        continue
+                        
+            except Exception as e:
+                logger.error(f"Error extracting ticker from logs: {e}")
+        
+        # Run ticker extraction with timeout
+        loop = asyncio.get_event_loop()
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                # Wait up to 30 seconds for ticker identification
+                await asyncio.wait_for(
+                    loop.run_in_executor(executor, extract_ticker_from_logs),
+                    timeout=30.0
+                )
+        except asyncio.TimeoutError:
+            logger.warning(f"⚠️ Ticker identification timeout for job {job_id}, continuing anyway...")
+            # If we couldn't identify ticker, keep "chat" as ticker
+            if not ticker_identified:
+                logger.info(f"Using fallback ticker 'chat' for job {job_id}")
+        except Exception as e:
+            logger.error(f"Error during ticker extraction: {e}")
+
+        # Now start monitoring info.log with the identified ticker
+        if ticker_identified and identified_ticker:
+            logger.info(f"✅ Ticker identified: {identified_ticker}, starting log monitoring...")
+        else:
+            logger.warning(f"⚠️ Ticker not identified, using 'chat' as fallback")
+        
+        log_task = asyncio.create_task(monitor_info_log(job_id, container))
+
+        try:
+            def wait_for_container():
+                return container.wait(timeout=1800)
+            
+            # Monitor for stop requests while container is running
+            stop_check_task = None
+            
+            async def check_stop_request():
+                """Periodically check if job should be stopped"""
+                while True:
+                    await asyncio.sleep(2)
+                    current_status = jobs[job_id].get("status")
+                    if current_status in ["stopping", "stopped"]:
+                        logger.info(f"Stop request detected for job {job_id}, killing container")
+                        try:
+                            container.reload()
+                            if container.status in ['running', 'paused']:
+                                container.kill()
+                                logger.info(f"Container {container.id[:12]} killed for chat job {job_id}")
+                        except Exception as kill_e:
+                            logger.error(f"Failed to kill container: {kill_e}")
+                        return
+            
+            # Start stop monitoring task
+            stop_check_task = asyncio.create_task(check_stop_request())
+            
+            try:
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    await loop.run_in_executor(executor, wait_for_container())
+            finally:
+                if stop_check_task:
+                    stop_check_task.cancel()
+
+        except Exception as e:
+            logger.error(f"Container wait timeout or error: {e}")
+            try:
+                container.reload()
+                if container.status in ['running', 'paused']:
+                    container.kill()
+            except docker.errors.NotFound:
+                logger.info(f"Container {container.id[:12]} already removed during error handling")
+            except Exception as kill_e:
+                logger.error(f"Failed to kill container during error handling: {kill_e}")
+                    
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = f"Chat session timeout: {str(e)}"
+            log_task.cancel()
+            return
+
+        # Cancel log monitoring task
+        log_task.cancel()
+        
+        # Try to get container exit code
+        exit_code = None
+        try:
+            container.reload()
+            exit_code = container.attrs['State']['ExitCode']
+        except docker.errors.NotFound:
+            logger.info(f"Container {container.id[:12]} was removed before exit code check")
+        except Exception as e:
+            logger.warning(f"Could not get container exit code: {e}")
+
+        # Check if job was stopped by user
+        current_status = jobs[job_id].get("status")
+        if current_status in ["stopping", "stopped"]:
+            if current_status == "stopping":
+                jobs[job_id]["status"] = "stopped"
+                jobs[job_id]["progress"] = "Chat stopped by user"
+            jobs[job_id]["completed_at"] = datetime.now().isoformat()
+            logger.info(f"✅ Chat job {job_id} stopped by user request")
+        elif exit_code == 0:
+            if jobs[job_id]["status"] != "completed":
+                jobs[job_id]["status"] = "completed"
+                jobs[job_id]["progress"] = "Chat session completed successfully"
+            jobs[job_id]["completed_at"] = datetime.now().isoformat()
+            logger.info(f"✅ Chat job {job_id} completed successfully")
+        elif exit_code is not None and exit_code != 0:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = f"Chat failed with exit code {exit_code}"
+            logger.error(f"❌ Chat job {job_id} failed with exit code {exit_code}")
+
+        # Remove container
+        current_final_status = jobs[job_id].get("status")
+        if current_final_status not in ["stopped"]:
+            try:
+                container.remove()
+                logger.info(f"Container {container.id[:12]} removed after chat completion")
+            except docker.errors.NotFound:
+                logger.info(f"Container {container.id[:12]} already removed")
+            except Exception as e:
+                logger.warning(f"Failed to remove container: {e}")
+        else:
+            logger.info(f"Container removal skipped - job was stopped by user")
+
+    except Exception as e:
+        logger.error(f"❌ Error in chat job {job_id}: {e}")
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"] = str(e)
+
 # ------------- Startup / health -------------
 @app.on_event("startup")
 async def startup_event():
@@ -1111,6 +1344,74 @@ async def process_nl_request_endpoint(nl_req: NLRequest, background_tasks: Backg
         raise HTTPException(status_code=400, detail=f"Failed to process request: {str(e)}")
 
 
+# ------------- Chat Feature -------------
+@app.post("/chat", response_model=JobResponse)
+async def start_chat(chat_req: ChatRequest, background_tasks: BackgroundTasks):
+    """
+    Start a chat session for conversational AI stock analysis.
+    
+    The chat pipeline allows interactive Q&A about stocks with session continuity.
+    
+    Args:
+        chat_req: Contains email, user_prompt, and optional session_id
+    
+    Returns:
+        Job information including job_id and status
+    """
+    if not docker_client:
+        raise HTTPException(status_code=503, detail="Docker service not available")
+
+    if not SERPAPI_API_KEY or not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=400, detail="API keys not configured")
+    
+    if not chat_req.email:
+        raise HTTPException(status_code=400, detail="User email is required")
+
+    try:
+        user_email = chat_req.email.lower()
+        request_timestamp = chat_req.timestamp
+
+        # Generate job_id using timestamp from request
+        # Extract datetime components from ISO timestamp (e.g., "2025-11-06T02:19:04")
+        timestamp_str = request_timestamp.replace("-", "").replace(":", "").replace("T", "_").split(".")[0]
+        job_id = f"chat_{timestamp_str}"
+
+        jobs[job_id] = {
+            "job_id": job_id,
+            "ticker": "chat",  # Not applicable for chat
+            "company": None,  # Not required for chat
+            "user_email": user_email,
+            "timestamp": request_timestamp,
+            "status": "pending",
+            "created_at": datetime.now().isoformat(),
+            "progress": "Chat session queued",
+            "user_prompt": chat_req.user_prompt,
+            "session_id": chat_req.session_id,
+            "pipeline": "chat"
+        }
+
+        # Start chat job in background
+        background_tasks.add_task(
+            run_chat_job,
+            job_id,
+            user_email,
+            request_timestamp,
+            chat_req.user_prompt,
+            chat_req.session_id
+        )
+
+        return JobResponse(
+            job_id=job_id, 
+            ticker="chat",  # Not applicable for chat
+            status="pending", 
+            message=f"Chat session started"
+        )
+
+    except Exception as e:
+        logger.error(f"Error starting chat session: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to start chat: {str(e)}")
+
+
 # ------------- Read job(s) -------------
 @app.get("/jobs/{job_id}", response_model=JobStatus)
 async def get_job_status(job_id: str):
@@ -1338,17 +1639,58 @@ async def get_job_logs_stream(job_id: str):
                 complete, pending = parts, ""
             else:
                 complete, pending = parts[:-1], parts[-1] if parts else ""
+            
+            # Track last two lines for SESSION_ID extraction
+            last_two_lines = []
+            
             for seg in complete:
                 line = seg.rstrip("\r\n")
                 if not line:
                     continue
                 have_seen_any_data = True
-                if "ENTIRE PROGRAM" in line:
+                
+                # Track last two lines
+                last_two_lines.append(line)
+                if len(last_two_lines) > 2:
+                    last_two_lines.pop(0)
+                
+                # Check for completion message
+                if "THE ENTIRE PROGRAM IS COMPLETED" in line:
                     job["status"] = "completed"
                     job["progress"] = "Analysis completed successfully"
-                    yield sse("completed", "The entire program is completed")
+                    
+                    # Extract SESSION_ID from second-to-last line if available
+                    session_id = None
+                    if len(last_two_lines) >= 2:
+                        second_last = last_two_lines[-2]
+                        if "SESSION_ID:" in second_last:
+                            # Extract session_id value after "SESSION_ID: "
+                            parts = second_last.split("SESSION_ID:")
+                            if len(parts) > 1:
+                                session_id = parts[1].strip()
+                    
+                    # Send completion with optional session_id
+                    completion_payload = {
+                        "status": "completed",
+                        "message": "The entire program is completed",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    if session_id:
+                        completion_payload["session_id"] = session_id
+                    
+                    yield f"event: completed\ndata: {json.dumps(completion_payload)}\n\n"
                 else:
-                    yield sse("log", line)
+                    # Determine message type: NL (natural language) or LOG
+                    message_type = "NL" if "[LLM]" in line else "LOG"
+                    
+                    payload = {
+                        "status": "log",
+                        "message": line,
+                        "type": message_type,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    yield f"event: log\ndata: {json.dumps(payload)}\n\n"
+            
             pending_line = pending
 
         async def drain_once():
