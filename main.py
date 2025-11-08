@@ -1615,6 +1615,86 @@ async def download_professional_report(job_id: str):
         logger.error(f"Error downloading professional report for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not read or convert professional report: {str(e)}")
 
+# ------------- Download Financial Summary as PDF -------------
+@app.get("/jobs/{job_id}/download/financial-summary")
+async def download_financial_summary(job_id: str):
+    """
+    Download financial summary report as PDF (converted from markdown)
+    """
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs[job_id]
+    ticker = (job.get("ticker") or "").upper()
+    
+    # Container-side path
+    base = Path(job_root(job))
+    md_path = base / "summaries" / f"{ticker}_financial_summary.md"
+
+    # Stability wait
+    for _ in range(6):
+        if md_path.exists() and md_path.stat().st_size > 0:
+            break
+        time.sleep(0.5)
+
+    if not md_path.exists():
+        raise HTTPException(status_code=404, detail="Financial summary not found")
+
+    try:
+        # Read markdown content
+        with open(md_path, 'r', encoding='utf-8') as f:
+            md_content = f.read()
+        
+        # Convert to PDF
+        pdf_bytes = convert_md_to_pdf(md_content, ticker)
+        
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_financial_summary.pdf"'}
+        return StreamingResponse(BytesIO(pdf_bytes), media_type='application/pdf', headers=headers)
+        
+    except Exception as e:
+        logger.error(f"Error downloading financial summary for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read or convert financial summary: {str(e)}")
+
+# ------------- Download News Summary as PDF -------------
+@app.get("/jobs/{job_id}/download/news-summary")
+async def download_news_summary(job_id: str):
+    """
+    Download news summary report as PDF (converted from markdown)
+    """
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs[job_id]
+    ticker = (job.get("ticker") or "").upper()
+    
+    # Container-side path
+    base = Path(job_root(job))
+    md_path = base / "summaries" / f"{ticker}_news_summary.md"
+
+    # Stability wait
+    for _ in range(6):
+        if md_path.exists() and md_path.stat().st_size > 0:
+            break
+        time.sleep(0.5)
+
+    if not md_path.exists():
+        raise HTTPException(status_code=404, detail="News summary not found")
+
+    try:
+        # Read markdown content
+        with open(md_path, 'r', encoding='utf-8') as f:
+            md_content = f.read()
+        
+        # Convert to PDF
+        pdf_bytes = convert_md_to_pdf(md_content, ticker)
+        
+        headers = {"Content-Disposition": f'attachment; filename="{ticker}_news_summary.pdf"'}
+        return StreamingResponse(BytesIO(pdf_bytes), media_type='application/pdf', headers=headers)
+        
+    except Exception as e:
+        logger.error(f"Error downloading news summary for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read or convert news summary: {str(e)}")
+
 # ------------- Tar all results (entire timestamp folder) -------------
 @app.get("/jobs/{job_id}/download/all-results")
 async def download_all_results(job_id: str):
@@ -1718,7 +1798,7 @@ async def download_all_results(job_id: str):
 @app.get("/jobs/{job_id}/files")
 async def list_job_files(job_id: str):
     """
-    List available files for a job. Now only checks for the 2 main download files.
+    List available files for a job. Checks for the 4 main download files.
     """
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1731,6 +1811,8 @@ async def list_job_files(job_id: str):
         files = {
             "financial_model": False,
             "professional_report": False,
+            "financial_summary": False,
+            "news_summary": False,
         }
 
         # Check for Excel financial model
@@ -1740,6 +1822,14 @@ async def list_job_files(job_id: str):
         # Check for professional analysis report
         md_path = base / "reports" / f"{ticker}_Professional_Analysis_Report.md"
         files["professional_report"] = md_path.exists()
+
+        # Check for financial summary
+        financial_summary_path = base / "summaries" / f"{ticker}_financial_summary.md"
+        files["financial_summary"] = financial_summary_path.exists()
+
+        # Check for news summary
+        news_summary_path = base / "summaries" / f"{ticker}_news_summary.md"
+        files["news_summary"] = news_summary_path.exists()
 
         return {
             "job_id": job_id,
