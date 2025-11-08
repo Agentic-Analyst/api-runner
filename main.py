@@ -40,7 +40,6 @@ from fastapi import Response
 import shlex, time, io, zipfile, hashlib
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware import Middleware
-from agents.gateway_agent import GatewayAgent
 from news_feed.news_manager import NewsManager
 
 # Load environment variables FIRST before any imports that use them
@@ -175,42 +174,7 @@ class JobRequest(BaseModel):
     email: str = Field(..., description="User email for data organization")
     llm: Optional[str] = Field(default="gpt-4o-mini", description="LLM model to use for analysis")
     pipeline: Optional[str] = Field(default=None, description="Pipeline to run (default: comprehensive)")
-    model: Optional[str] = Field(default=None, description="Financial model type (default: comprehensive)")
-    years: Optional[int] = Field(default=None, description="Projection years (default: 5)")
-    term_growth: Optional[float] = Field(default=None, description="Terminal growth rate (auto-inferred)")
-    wacc: Optional[float] = Field(default=None, description="Override WACC (auto-inferred)")
-    strategy: Optional[str] = Field(default=None, description="Force specific forecast strategy")
     query: Optional[str] = Field(default=None, description="Search query for news-related pipelines (e.g., 'AAPL earnings Q3')")
-    peers: Optional[str] = Field(default=None, description="Comma-separated peer tickers for comparable analysis (e.g., 'AAPL,MSFT,GOOGL')")
-    max_searched: Optional[int] = Field(default=None, description="Maximum articles to scrape (default: 20)")
-    min_score: Optional[float] = Field(default=None, description="Minimum relevance score (default: 3.0)")
-    max_filtered: Optional[int] = Field(default=None, description="Maximum filtered articles (default: 10)")
-    min_confidence: Optional[float] = Field(default=None, description="Minimum confidence (default: 0.5)")
-    scaling: Optional[float] = Field(default=None, description="Base scaling factor (default: 0.15)")
-    adjustment_cap: Optional[float] = Field(default=None, description="Maximum adjustment % (default: 0.20)")
-
-class NLRequest(BaseModel):
-    """Natural language request model that includes the request text plus optional override parameters."""
-    request: str = Field(..., description="Natural language request describing the analysis task")
-    # Optional overrides - if provided, these take priority over NL-extracted values
-    ticker: Optional[str] = Field(default=None, description="Stock ticker symbol (e.g., NVDA)")
-    company: Optional[str] = Field(default=None, description="Company name (e.g., 'NVIDIA')")
-    email: str = Field(..., description="User email for data organization")
-    llm: Optional[str] = Field(default="gpt-4o-mini", description="LLM model to use for analysis")
-    pipeline: Optional[str] = Field(default=None, description="Pipeline to run (default: comprehensive)")
-    model: Optional[str] = Field(default=None, description="Financial model type (default: comprehensive)")
-    years: Optional[int] = Field(default=None, description="Projection years (default: 5)")
-    term_growth: Optional[float] = Field(default=None, description="Terminal growth rate (auto-inferred)")
-    wacc: Optional[float] = Field(default=None, description="Override WACC (auto-inferred)")
-    strategy: Optional[str] = Field(default=None, description="Force specific forecast strategy")
-    query: Optional[str] = Field(default=None, description="Search query for news-related pipelines (e.g., 'AAPL earnings Q3')")
-    peers: Optional[str] = Field(default=None, description="Comma-separated peer tickers for comparable analysis (e.g., 'AAPL,MSFT,GOOGL')")
-    max_searched: Optional[int] = Field(default=None, description="Maximum articles to scrape (default: 20)")
-    min_score: Optional[float] = Field(default=None, description="Minimum relevance score (default: 3.0)")
-    max_filtered: Optional[int] = Field(default=None, description="Maximum filtered articles (default: 10)")
-    min_confidence: Optional[float] = Field(default=None, description="Minimum confidence (default: 0.5)")
-    scaling: Optional[float] = Field(default=None, description="Base scaling factor (default: 0.15)")
-    adjustment_cap: Optional[float] = Field(default=None, description="Maximum adjustment % (default: 0.20)")
 
 class JobResponse(BaseModel):
     job_id: str
@@ -237,169 +201,6 @@ class JobStatus(BaseModel):
     latest_log: Optional[str] = None
     last_activity: Optional[str] = None
     recent_logs: Optional[List[str]] = None
-
-def process_nl_request(nl_req: NLRequest) -> JobRequest:
-    """
-    Process natural language request through NLAgent and merge with provided parameters.
-    Provided parameters take priority over NL-extracted ones.
-    """
-    
-    def safe_convert_value(value, expected_type, param_name):
-        """
-        Safely convert LLM-extracted values to expected types with proper error handling.
-        """
-        if value is None:
-            return None
-            
-        try:
-            # Handle string parameters
-            if expected_type == str:
-                if isinstance(value, list):
-                    if len(value) > 0:
-                        # Special handling for peers parameter - convert list to comma-separated string
-                        if param_name == 'peers':
-                            # Join all values with commas, stripping whitespace
-                            peer_list = [str(v).strip().upper() for v in value if str(v).strip()]
-                            if peer_list:
-                                logger.info(f"Converting peer list to comma-separated string: {value} -> {','.join(peer_list)}")
-                                return ','.join(peer_list)
-                            else:
-                                logger.warning(f"Empty peer list after filtering: {value}")
-                                return None
-                        else:
-                            # For other string parameters, take the first element
-                            return str(value[0])
-                    else:
-                        # Empty list
-                        logger.warning(f"Empty list provided for {param_name}")
-                        return None
-                elif isinstance(value, (str, int, float)):
-                    # For peers, ensure it's properly formatted (uppercase, no extra spaces)
-                    if param_name == 'peers':
-                        # Clean up comma-separated peer string
-                        peers_str = str(value).strip()
-                        if peers_str:
-                            peer_list = [p.strip().upper() for p in peers_str.split(',') if p.strip()]
-                            if peer_list:
-                                cleaned_peers = ','.join(peer_list)
-                                logger.info(f"Cleaned peer string: {value} -> {cleaned_peers}")
-                                return cleaned_peers
-                        return None
-                    else:
-                        return str(value)
-                else:
-                    logger.warning(f"Unexpected type for {param_name}: {type(value)}, value: {value}")
-                    return str(value)
-            
-            # Handle integer parameters
-            elif expected_type == int:
-                if isinstance(value, list):
-                    if len(value) > 0:
-                        return int(float(value[0]))  # Handle case where list contains string numbers
-                    else:
-                        logger.warning(f"Empty list provided for {param_name}")
-                        return None
-                elif isinstance(value, (int, float)):
-                    return int(value)
-                elif isinstance(value, str):
-                    return int(float(value))  # Handle string numbers
-                else:
-                    logger.warning(f"Cannot convert {param_name} to int: {value}")
-                    return None
-            
-            # Handle float parameters
-            elif expected_type == float:
-                if isinstance(value, list):
-                    if len(value) > 0:
-                        return float(value[0])
-                    else:
-                        logger.warning(f"Empty list provided for {param_name}")
-                        return None
-                elif isinstance(value, (int, float)):
-                    return float(value)
-                elif isinstance(value, str):
-                    return float(value)
-                else:
-                    logger.warning(f"Cannot convert {param_name} to float: {value}")
-                    return None
-            
-            # Default: return as-is
-            return value
-            
-        except (ValueError, TypeError, IndexError) as e:
-            logger.warning(f"Error converting {param_name} (value: {value}): {e}")
-            return None
-    
-    try:
-        # Use GatewayAgent to extract parameters from the request
-        gateway_agent = GatewayAgent()
-        extracted_args = gateway_agent.process_request(nl_req.request)
-
-        logger.info(f"Gateway Agent extracted: {extracted_args}")
-
-        # Create final parameters by merging extracted and provided values
-        # Provided values take priority over extracted ones
-        final_args = {}
-        
-        # Handle ticker - prefer provided, then extracted, then raise error
-        if nl_req.ticker:
-            final_args['ticker'] = nl_req.ticker
-        elif extracted_args.get('ticker'):
-            final_args['ticker'] = safe_convert_value(extracted_args['ticker'], str, 'ticker')
-        else:
-            raise ValueError("No ticker found in request or provided parameters")
-            
-        # Handle company - prefer provided, then extracted (mapped from company_name), then raise error
-        if nl_req.company:
-            final_args['company'] = nl_req.company
-        elif extracted_args.get('company_name'):
-            final_args['company'] = safe_convert_value(extracted_args['company_name'], str, 'company_name')
-        elif extracted_args.get('company'):
-            final_args['company'] = safe_convert_value(extracted_args['company'], str, 'company')
-        else:
-            raise ValueError("No company found in request or provided parameters")
-            
-        # Email is always required from the request
-        final_args['email'] = nl_req.email
-        
-        # For other parameters, prefer provided, then extracted, then None (use defaults)
-        # Define expected types for validation
-        param_mapping = {
-            'llm': ('llm', str),
-            'pipeline': ('pipeline', str),
-            'model': ('model', str), 
-            'years': ('years', int),
-            'term_growth': ('term_growth', float),
-            'wacc': ('wacc', float),
-            'strategy': ('strategy', str),
-            'query': ('query', str),
-            'peers': ('peers', str),
-            'max_searched': ('max_searched', int),
-            'min_score': ('min_score', float),
-            'max_filtered': ('max_filtered', int),
-            'min_confidence': ('min_confidence', float),
-            'scaling': ('scaling', float),
-            'adjustment_cap': ('adjustment_cap', float)
-        }
-        
-        for param_name, (extracted_key, expected_type) in param_mapping.items():
-            provided_value = getattr(nl_req, param_name, None)
-            if provided_value is not None:
-                final_args[param_name] = provided_value
-            elif extracted_args.get(extracted_key) is not None:
-                converted_value = safe_convert_value(extracted_args[extracted_key], expected_type, param_name)
-                if converted_value is not None:
-                    final_args[param_name] = converted_value
-            # else: leave as None to use defaults
-        
-        logger.info(f"Final merged parameters: {final_args}")
-        
-        # Create and return JobRequest with merged parameters
-        return JobRequest(**final_args)
-        
-    except Exception as e:
-        logger.error(f"Error processing NL request: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to process natural language request: {str(e)}")
 
 # ------------- Docker helpers -------------
 def init_docker_client():
@@ -560,13 +361,8 @@ async def monitor_info_log(job_id: str, container):
 # ------------- Job runner -------------
 async def run_analysis_job(job_id: str, ticker: str, company: Optional[str], 
                          email: Optional[str], timestamp: Optional[str],
-                         llm: Optional[str] = None, pipeline: Optional[str] = None, model: Optional[str] = None, 
-                         years: Optional[int] = None, term_growth: Optional[float] = None,
-                         wacc: Optional[float] = None, strategy: Optional[str] = None,
-                         query: Optional[str] = None, peers: Optional[str] = None,
-                         max_searched: Optional[int] = None, min_score: Optional[float] = None, 
-                         max_filtered: Optional[int] = None, min_confidence: Optional[float] = None,
-                         scaling: Optional[float] = None, adjustment_cap: Optional[float] = None):
+                         llm: Optional[str] = None, pipeline: Optional[str] = None,
+                         query: Optional[str] = None):
     """
     Run stock analysis job in Docker container.
     """
@@ -594,32 +390,8 @@ async def run_analysis_job(job_id: str, ticker: str, company: Optional[str],
             cmd.extend(["--llm", llm])
         if pipeline:
             cmd.extend(["--pipeline", pipeline])
-        if model:
-            cmd.extend(["--model", model])
-        if years is not None:
-            cmd.extend(["--years", str(years)])
-        if term_growth is not None:
-            cmd.extend(["--term-growth", str(term_growth)])
-        if wacc is not None:
-            cmd.extend(["--wacc", str(wacc)])
-        if strategy:
-            cmd.extend(["--strategy", strategy])
         if query:
             cmd.extend(["--query", query])
-        if peers:
-            cmd.extend(["--peers", peers])
-        if max_searched is not None:
-            cmd.extend(["--max-searched", str(max_searched)])
-        if min_score is not None:
-            cmd.extend(["--min-score", str(min_score)])
-        if max_filtered is not None:
-            cmd.extend(["--max-filtered", str(max_filtered)])
-        if min_confidence is not None:
-            cmd.extend(["--min-confidence", str(min_confidence)])
-        if scaling is not None:
-            cmd.extend(["--scaling", str(scaling)])
-        if adjustment_cap is not None:
-            cmd.extend(["--adjustment-cap", str(adjustment_cap)])
 
         logger.info(f"🚀 Starting analysis for {ticker} ({company}) with command: {cmd}")
         jobs[job_id]["progress"] = f"Running {pipeline} analysis for {ticker} ({company})..."
@@ -1280,71 +1052,10 @@ async def start_analysis(job: JobRequest, background_tasks: BackgroundTasks):
         run_analysis_job,
         job_id, job.ticker, job.company,
         user_email, current_timestamp,
-        job.llm, job.pipeline, job.model, job.years, job.term_growth,
-        job.wacc, job.strategy, job.query, job.peers, job.max_searched, job.min_score,
-        job.max_filtered, job.min_confidence, job.scaling, job.adjustment_cap,
+        job.llm, job.pipeline, job.query,
     )
 
-    return JobResponse(job_id=job_id, status="pending", message="Analysis job started")
-
-# ------------- Natural Language Request Processing -------------
-@app.post("/nl/request", response_model=JobResponse)
-async def process_nl_request_endpoint(nl_req: NLRequest, background_tasks: BackgroundTasks):
-    """
-    Process a natural language request for stock analysis.
-    
-    The request text is processed by NLAgent to extract parameters, which are then
-    merged with any explicitly provided parameters (provided parameters take priority).
-    """
-    if not docker_client:
-        raise HTTPException(status_code=503, detail="Docker service not available")
-
-    if not SERPAPI_API_KEY or not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=400, detail="API keys not configured")
-    
-    if not nl_req.email:
-        raise HTTPException(status_code=400, detail="User email is required")
-
-    try:
-        # Process the natural language request and get merged parameters
-        job_request = process_nl_request(nl_req)
-        
-        # Log the processing result
-        logger.info(f"Processed NL request: '{nl_req.request}' -> ticker: {job_request.ticker}, company: {job_request.company}")
-        
-        # Use the existing start_analysis logic
-        current_timestamp = datetime.now().isoformat()
-        user_email = job_request.email.lower()
-
-        job_id = f"{job_request.ticker}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-        jobs[job_id] = {
-            "job_id": job_id,
-            "ticker": job_request.ticker,
-            "company": job_request.company,
-            "user_email": user_email,
-            "timestamp": current_timestamp,
-            "status": "pending",
-            "created_at": datetime.now().isoformat(),
-            "progress": "Job queued from natural language request",
-            "original_request": nl_req.request,  # Store the original NL request for reference
-        }
-
-        background_tasks.add_task(
-            run_analysis_job,
-            job_id, job_request.ticker, job_request.company,
-            user_email, current_timestamp,
-            job_request.llm, job_request.pipeline, job_request.model, job_request.years, job_request.term_growth,
-            job_request.wacc, job_request.strategy, job_request.query, job_request.peers, job_request.max_searched, job_request.min_score,
-            job_request.max_filtered, job_request.min_confidence, job_request.scaling, job_request.adjustment_cap,
-        )
-
-        return JobResponse(job_id=job_id, ticker=job_request.ticker, status="pending", message=f"Natural language analysis job started for {job_request.ticker}")
-
-    except Exception as e:
-        logger.error(f"Error in NL request processing: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to process request: {str(e)}")
-
+    return JobResponse(job_id=job_id, ticker=job.ticker, status="pending", message="Analysis job started")
 
 # ------------- Chat Feature -------------
 @app.post("/chat", response_model=JobResponse)
