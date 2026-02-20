@@ -1,541 +1,884 @@
-# API Runner
+# 📈 Stock Analyst API Runner
 
-A FastAPI service to manage and run stock analysis jobs using Docker containers.
+> **A high-performance FastAPI orchestration service for AI-powered stock analysis, real-time market data streaming, and automated intelligence report generation.**
 
-## Setup
+[![Python 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.104-009688.svg)](https://fastapi.tiangolo.com/)
+[![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED.svg)](https://www.docker.com/)
+[![MongoDB](https://img.shields.io/badge/MongoDB-Async-47A248.svg)](https://www.mongodb.com/)
+[![WebSocket](https://img.shields.io/badge/WebSocket-Real--time-FF6F00.svg)](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket)
 
-docker build -t fuzanwenn/api-runner:latest .
-docker push fuzanwenn/api-runner:latest
-docker compose pull api-runner               
-docker compose up -d --force-recreate api-runner
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [System Architecture](#system-architecture)
+- [Key Features](#key-features)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [Getting Started](#getting-started)
+  - [Prerequisites](#prerequisites)
+  - [Environment Configuration](#environment-configuration)
+  - [Local Development](#local-development)
+  - [Docker Deployment](#docker-deployment)
+  - [Production Deployment](#production-deployment)
+- [API Reference](#api-reference)
+  - [Authentication](#authentication)
+  - [Analysis Jobs](#analysis-jobs)
+  - [Chat Pipeline](#chat-pipeline)
+  - [Real-time Stock Prices](#real-time-stock-prices)
+  - [News Feed System](#news-feed-system)
+  - [Daily Intelligence Reports](#daily-intelligence-reports)
+  - [File Downloads](#file-downloads)
+  - [Health & Monitoring](#health--monitoring)
+- [WebSocket Protocols](#websocket-protocols)
+- [Data Architecture](#data-architecture)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Overview
+
+The **Stock Analyst API Runner** is a production-grade orchestration layer that manages the full lifecycle of AI-driven stock analysis workflows. It acts as the central control plane — receiving analysis requests, spinning up isolated Docker containers for each pipeline run, streaming real-time progress back to clients, and delivering structured outputs (PDF reports, Excel financial models, markdown summaries).
+
+### What It Does
+
+1. **Orchestrates Analysis Pipelines** — Receives a ticker and configuration, spawns a containerized backend engine that performs web scraping, NLP-based article screening, LLM-powered analysis, DCF financial modeling, and professional report generation.
+2. **Streams Real-time Market Data** — Maintains persistent WebSocket connections for live stock price updates (via Yahoo Finance), with intelligent caching and background polling every 10 seconds.
+3. **Aggregates & Streams News** — Queries MongoDB for curated news articles per ticker, triggers backend scraping jobs for fresh data, and streams results to clients over WebSocket.
+4. **Generates Daily Intelligence Reports** — Produces automated company-level and sector-level daily briefings, with markdown-to-PDF conversion for institutional-quality deliverables.
+5. **Supports Interactive Chat** — Provides a conversational AI pipeline where users ask natural-language questions about stocks, and the system dynamically identifies tickers and runs targeted analysis.
+
+---
+
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            CLIENT LAYER                                     │
+│   React Frontend  ·  Mobile App  ·  CLI  ·  Third-Party Integrations        │
+└──────────┬─────────────────┬──────────────────┬─────────────────────────────┘
+           │ HTTP/REST       │ WebSocket         │ SSE (Server-Sent Events)
+           ▼                 ▼                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      API RUNNER (FastAPI · Port 8080)                        │
+│                                                                             │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐  │
+│  │  Auth Module  │  │  Job Engine  │  │   Realtime   │  │   News Feed    │  │
+│  │              │  │              │  │   Module     │  │    Module      │  │
+│  │ · Google OAuth│  │ · Run/Stop  │  │              │  │               │  │
+│  │ · GitHub OAuth│  │ · SSE Stream│  │ · Price Fetch│  │ · MongoDB DAO │  │
+│  │ · Email Code │  │ · Log Monitor│  │ · WebSocket  │  │ · WebSocket   │  │
+│  │ · Sessions   │  │ · Downloads │  │ · Historical │  │ · Auto-Update │  │
+│  └──────────────┘  └──────┬───────┘  └──────────────┘  └────────────────┘  │
+│                           │                                                  │
+│  ┌──────────────┐  ┌──────┴───────┐  ┌──────────────┐  ┌────────────────┐  │
+│  │  Daily Reports│  │  Chat Engine │  │  PDF Converter│  │   Config       │  │
+│  │              │  │              │  │              │  │                │  │
+│  │ · Company    │  │ · NL Query   │  │ · Markdown→PDF│  │ · Env Vars    │  │
+│  │ · Sector     │  │ · Ticker ID  │  │ · ReportLab  │  │ · API Keys    │  │
+│  │ · Scheduler  │  │ · Session    │  │ · TOC/Links  │  │ · Docker Cfg  │  │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └────────────────┘  │
+└──────────┬──────────────────────────────────────────────────────────────────┘
+           │ Docker SDK (docker.sock)
+           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     CONTAINER ORCHESTRATION                                  │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  Backend Analysis Container (stock-analyst:latest)               │        │
+│  │                                                                 │        │
+│  │  Pipelines: comprehensive · financial-only · model-only         │        │
+│  │             news-only · model-to-price · chat                   │        │
+│  │                                                                 │        │
+│  │  Capabilities: Web Scraping · Article NLP · LLM Analysis        │        │
+│  │                DCF Modeling · Price Adjustment · Report Gen      │        │
+│  └─────────────────────────┬───────────────────────────────────────┘        │
+│                            │                                                 │
+│                ┌───────────▼───────────┐                                     │
+│                │   stockdata (Volume)   │                                     │
+│                │ /data/<email>/<TICKER>/ │                                    │
+│                │       /<timestamp>/    │                                     │
+│                └───────────────────────┘                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        EXTERNAL SERVICES                                     │
+│                                                                             │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌───────────────────────┐ │
+│  │  SerpAPI    │  │   OpenAI   │  │ Anthropic  │  │   MongoDB Atlas       │ │
+│  │ Web Search  │  │  GPT-4o    │  │  Claude    │  │  News Articles        │ │
+│  └────────────┘  └────────────┘  └────────────┘  └───────────────────────┘ │
+│                                                                             │
+│  ┌────────────┐                                                             │
+│  │  Yahoo     │                                                             │
+│  │  Finance   │                                                             │
+│  │  (yfinance)│                                                             │
+│  └────────────┘                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Docker-in-Docker Pattern
+
+The API Runner itself runs inside a Docker container and uses the host Docker socket (`/var/run/docker.sock`) to spawn ephemeral analysis containers. Each analysis job runs in complete isolation with its own environment, sharing only the persistent `stockdata` volume for I/O. This architecture ensures:
+
+- **Process Isolation** — Each analysis job is sandboxed in its own container
+- **Resource Control** — Containers are automatically removed after completion
+- **Horizontal Scalability** — Multiple analysis jobs can run concurrently
+- **Fault Tolerance** — A crashed analysis container does not affect the API service
+
+---
+
+## Key Features
+
+| Feature | Description |
+|---|---|
+| **Multi-Pipeline Analysis** | Run comprehensive, financial-only, news-only, or chat-based analysis pipelines in isolated containers |
+| **Real-time SSE Streaming** | Server-Sent Events for live log streaming with progress stages, heartbeats, and completion signals |
+| **WebSocket Price Feed** | Real-time stock price updates every 10s with subscription management via yfinance |
+| **WebSocket News Feed** | Real-time news article streaming with per-ticker subscriptions and auto-updates from MongoDB |
+| **Multi-Provider Auth** | Google OAuth 2.0, GitHub OAuth, and email verification code login with session management |
+| **PDF Report Generation** | Professional-grade PDF conversion from markdown with TOC, internal links, and custom styling via ReportLab |
+| **Daily Intelligence Reports** | Automated company and sector briefings with pre-market scheduling (8:30 AM ET) |
+| **Chat Interface** | Conversational AI that identifies tickers from natural language and runs targeted analysis pipelines |
+| **Job Lifecycle Management** | Create, monitor, stop (graceful SIGTERM), and clean up analysis jobs with full state tracking |
+| **File Downloads** | Excel financial models (.xlsx), PDF reports, markdown summaries, and complete tar archives |
+| **Graceful Shutdown** | SIGTERM-based container stopping with 10s timeout, state preservation, and user notification |
+| **Health Monitoring** | Multi-level health checks across Docker, real-time services, news feeds, and API key configuration |
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| **Web Framework** | FastAPI 0.104 + Uvicorn (ASGI) |
+| **Language** | Python 3.11 (Miniconda) |
+| **Container Runtime** | Docker SDK for Python 7.1 |
+| **Database** | MongoDB (async via Motor 3.5 + PyMongo 4.5) |
+| **Data Layer** | [vynn_core](https://github.com/Agentic-Analyst/vynn-core) — shared article DAO and indexes |
+| **Market Data** | yfinance (Yahoo Finance API) |
+| **LLM Providers** | OpenAI (GPT-4o / GPT-4o-mini) · Anthropic (Claude) |
+| **Web Scraping** | SerpAPI · BeautifulSoup4 · newspaper3k · feedparser · NLTK |
+| **PDF Generation** | ReportLab · pypdf |
+| **Authentication** | Authlib (OAuth 2.0 / OIDC) · HMAC-SHA256 tokens · Starlette sessions |
+| **Real-time Comms** | FastAPI native WebSocket · Server-Sent Events (SSE) |
+| **Deployment** | Docker · Docker Compose · Multi-arch builds (linux/amd64 + linux/arm64) |
+
+---
+
+## Project Structure
+
+```
+api-runner/
+├── main.py                          # FastAPI app entry point & job orchestration (~1900 lines)
+├── config.py                        # Centralized environment variable configuration
+├── auth_oauth.py                    # Google & GitHub OAuth 2.0 authentication
+├── auth_code_login.py               # Email verification code authentication (dev-friendly)
+├── md_pdf_converter.py              # Full-featured Markdown → PDF converter (ReportLab)
+├── requirements.txt                 # Python dependencies
+├── Dockerfile                       # Docker build (Miniconda + Python 3.11.13)
+├── docker-compose.dev.yml           # Development Docker Compose configuration
+├── build.sh                         # Docker image build helper script
+├── start.sh                         # Local development startup script
+├── API_DOCUMENTATION.md             # Extended API documentation with frontend examples
+│
+├── realtime/                        # 📊 Real-time Stock Price System
+│   ├── __init__.py                  # Module exports (PriceManager, stock_router, etc.)
+│   ├── models.py                    # Pydantic models (StockPrice, PriceUpdate, HistoricalData, etc.)
+│   ├── price_fetcher.py             # yfinance integration + PriceManager background loop (10s interval)
+│   ├── stock_api.py                 # REST endpoints (/api/realtime/*) + WebSocket entry point
+│   ├── fastapi_websocket.py         # WebSocket connection manager (integrated with main FastAPI app)
+│   └── websocket_server.py          # [Deprecated] Legacy standalone WebSocket server (reference only)
+│
+├── news_feed/                       # 📰 News Feed Aggregation System
+│   ├── __init__.py                  # Module exports
+│   ├── models.py                    # Pydantic models (NewsArticle, NewsSubscription, etc.)
+│   ├── api.py                       # REST endpoints (/api/news/*) with dependency injection
+│   ├── news_manager.py              # MongoDB queries via vynn_core + Docker job coordination
+│   ├── news_websocket.py            # WebSocket manager for streaming news with dead-connection handling
+│   └── news_auto_updater.py         # Background news refresh with smart rate limiting (SerpAPI quotas)
+│
+└── reports/                         # 📋 Automated Report Generation
+    ├── __init__.py
+    ├── daily/
+    │   ├── __init__.py
+    │   ├── models.py                # Pydantic models (CompanyDailyReportRequest, BatchJobResponse, etc.)
+    │   ├── api.py                   # REST endpoints (/api/daily-reports/*) for company & sector reports
+    │   ├── scheduler.py             # Pre-market cron scheduler (8:30 AM ET, Mon–Fri, auto-skip weekends)
+    │   └── daily_report_pdf_converter.py  # Daily report-optimized PDF styling with section boxes
+    └── hourly/                      # [Planned] Hourly report generation
+```
+
+---
+
+## Getting Started
 
 ### Prerequisites
 
-You'll need API keys for the stock analyst backend:
-- **SERPAPI_API_KEY**: Get from [SerpApi](https://serpapi.com/)
-- **OPENAI_API_KEY**: Get from [OpenAI](https://platform.openai.com/api-keys)
+| Requirement | Version | Purpose |
+|---|---|---|
+| **Docker** | ≥ 20.10 | Container runtime for spawning analysis jobs |
+| **Python** | 3.11+ | API runtime (when running locally outside Docker) |
+| **MongoDB** | ≥ 6.0 | News article storage (MongoDB Atlas or self-hosted) |
+| **Backend Image** | `stock-analyst:latest` | The analysis engine Docker image (separate repo) |
 
-### Upload to Hetzner
+### Environment Configuration
+
+Create a `.env` file in the project root:
+
+```bash
+# ═══════════════════════════════════════════════════════════
+# API Keys (Required)
+# ═══════════════════════════════════════════════════════════
+SERPAPI_API_KEY=your_serpapi_key              # https://serpapi.com/
+OPENAI_API_KEY=sk-your_openai_key            # https://platform.openai.com/api-keys
+ANTHROPIC_API_KEY=sk-ant-your_key            # https://console.anthropic.com/
+
+# ═══════════════════════════════════════════════════════════
+# MongoDB Configuration
+# ═══════════════════════════════════════════════════════════
+MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/
+MONGO_DB=your_database_name
+
+# ═══════════════════════════════════════════════════════════
+# Docker Configuration
+# ═══════════════════════════════════════════════════════════
+BACKEND_IMAGE=stock-analyst:latest           # Analysis engine Docker image
+DATA_VOLUME=stockdata                        # Persistent data volume name
+
+# ═══════════════════════════════════════════════════════════
+# OAuth (Optional — enable for Google/GitHub login)
+# ═══════════════════════════════════════════════════════════
+OAUTH_GOOGLE_CLIENT_ID=your_google_client_id
+OAUTH_GOOGLE_CLIENT_SECRET=your_google_secret
+OAUTH_GITHUB_CLIENT_ID=your_github_client_id
+OAUTH_GITHUB_CLIENT_SECRET=your_github_secret
+
+# ═══════════════════════════════════════════════════════════
+# Session & Security
+# ═══════════════════════════════════════════════════════════
+SESSION_SECRET=change-me-to-random-string
+AUTH_SECRET=change-me-to-another-random-string
+SESSION_HTTPS_ONLY=false                     # true in production
+SESSION_SAMESITE=lax                         # lax | strict | none
+SESSION_STORE_COOKIE=session
+COOKIE_DOMAIN=localhost
+
+# ═══════════════════════════════════════════════════════════
+# Frontend & Reverse Proxy
+# ═══════════════════════════════════════════════════════════
+FRONTEND_ORIGIN=http://localhost:3000        # Comma-separated for multiple
+ROOT_PATH=                                   # e.g., /api if behind proxy
+OAUTH_REDIRECT_BASE=                         # e.g., https://yourdomain.com/api
+
+# ═══════════════════════════════════════════════════════════
+# Dev Login (Development Only)
+# ═══════════════════════════════════════════════════════════
+HARDCODED_LOGIN_CODE=246810
+```
+
+### Local Development
+
+```bash
+# 1. Clone and setup
+git clone <repo-url> && cd api-runner
+python -m venv .venv && source .venv/bin/activate
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Configure environment
+cp .env.example .env   # Edit with your API keys
+
+# 4. Ensure Docker is running and data volume exists
+docker volume create stockdata
+
+# 5. Start the development server (with hot reload)
+./start.sh
+# Or manually:
+uvicorn main:app --reload --host 0.0.0.0 --port 8080
+```
+
+The API will be available at **http://localhost:8080**.  
+Interactive Swagger docs at **http://localhost:8080/docs**.
+
+### Docker Deployment
+
+```bash
+# Build the API Runner image
+./build.sh
+# Or manually:
+docker build -t stock-analyst-runner:latest .
+
+# Create persistent data volume
+docker volume create stockdata
+
+# Run the container
+docker run -d \
+  -p 8080:8080 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v stockdata:/data \
+  --env-file .env \
+  --name api-runner \
+  stock-analyst-runner:latest
+```
+
+### Docker Compose (Recommended)
+
+```bash
+# Development environment
+docker compose -f docker-compose.dev.yml up --build -d
+
+# View logs
+docker compose -f docker-compose.dev.yml logs -f api-runner
+
+# Rebuild after code changes
+docker compose -f docker-compose.dev.yml down
+docker compose -f docker-compose.dev.yml up --build -d
+```
+
+### Production Deployment
+
+```bash
+# Build multi-arch image and push to registry
 docker buildx build --platform linux/amd64,linux/arm64 \
   -t fuzanwenn/api-runner:latest \
   --push .
 
-#### In the server
-docker compose pull api && docker compose up -d api
-
-### Local Development
-
-1. Create a virtual environment:
-```bash
-python -m venv .venv
-source .venv/bin/activate  # On macOS/Linux
+# On the production server
+docker compose pull api-runner
+docker compose up -d --force-recreate api-runner
 ```
 
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+---
 
-3. Set up environment variables:
-```bash
-cp .env.example .env
-# Edit .env file and add your API keys
-```
+## API Reference
 
-4. Run the application:
-```bash
-./start.sh
-```
+**Base URL:** `http://localhost:8080`  
+**Interactive Docs:** `http://localhost:8080/docs` (Swagger UI)
 
-Or manually:
-```bash
-export SERPAPI_API_KEY="your_serpapi_key"
-export OPENAI_API_KEY="your_openai_key"
-uvicorn main:app --reload --host 0.0.0.0 --port 8080
-```
+### Authentication
 
-### Docker Setup and Management
+Three authentication methods are supported. All auth endpoints are under `/auth`.
 
-This application uses a multi-container Docker architecture:
-- **API Runner Container**: FastAPI service (this repository)  
-- **Backend Analysis Container**: Stock analysis engine (`stock-analyst:latest` image)
-- **Data Volume**: Persistent storage for analysis results (`stockdata` volume)
+#### Google OAuth 2.0
 
-#### Initial Setup
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/auth/google/login?redirect_url=<url>` | Initiate Google OIDC flow |
+| `GET` | `/auth/google/callback` | OAuth callback (automatic) |
 
-1. **Create environment file:**
-```bash
-cp .env.example .env
-# Edit .env file and add your API keys:
-# SERPAPI_API_KEY=your_serpapi_key_here
-# OPENAI_API_KEY=your_openai_key_here
-```
+#### GitHub OAuth
 
-2. **Create the data volume:**
-```bash
-# This volume persists analysis results across container restarts
-docker volume create stockdata
-```
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/auth/github/login?redirect_url=<url>` | Initiate GitHub OAuth flow |
+| `GET` | `/auth/github/callback` | OAuth callback (automatic) |
 
-3. **Ensure backend image exists:**
-```bash
-# Check if the stock analysis backend image is available
-docker images | grep stock-analyst
-
-# If not available, you need to build or pull the stock-analyst image first
-# This image should contain the actual stock analysis pipeline
-```
-
-#### Building and Running the API Runner
-
-**Option 1: Docker Build (Recommended for development)**
-```bash
-# Clean up any existing containers
-docker ps -a | grep api-runner
-docker stop api-runner 2>/dev/null && docker rm api-runner 2>/dev/null
-
-# Build and run the API runner
-docker build -t stock-analyst-runner . && echo "Build completed successfully"
-docker run -d \
-  -p 8080:8080 \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v stockdata:/data \
-  --env-file .env \
-  --name api-runner \
-  stock-analyst-runner
-```
-
-**Option 2: Docker Compose (Recommended for production)**
-```bash
-# Create .env file first (as above)
-cp .env.example .env
-
-# Start all services
-docker-compose up --build -d
-
-# View logs
-docker-compose logs -f api-runner
-```
-
-#### Rebuilding After Code Changes
-
-When you make changes to this repository, rebuild and restart:
+#### Email Verification Code
 
 ```bash
-# Stop the current container
-docker stop api-runner && docker rm api-runner
-
-# Rebuild with no cache to ensure fresh build
-docker build --no-cache -t stock-analyst-runner .
-
-# Restart the container
-docker run -d \
-  -p 8080:8080 \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v stockdata:/data \
-  --env-file .env \
-  --name api-runner \
-  stock-analyst-runner
-```
-
-Or with Docker Compose:
-```bash
-# Rebuild and restart
-docker-compose down
-docker-compose up --build -d
-```
-
-#### Docker Architecture Details
-
-**Volume Mounting:**
-- `/var/run/docker.sock` - Allows API runner to control Docker daemon
-- `stockdata:/data` - Persistent data storage for analysis results
-- Backend containers mount `stockdata:/data` for reading/writing analysis files
-
-**Network Flow:**
-1. API Runner receives job requests
-2. API Runner spawns Backend Analysis containers with shared volume
-3. Backend containers write results to `/data/{TICKER}/` directory
-4. API Runner reads results from volume and serves downloads
-
-**Data Structure in Volume:**
-```
-stockdata/
-├── NVDA/                    # One folder per ticker
-│   ├── info.log            # Real-time analysis logs
-│   ├── screening_report.md  # LLM analysis report
-│   ├── screening_data.json  # Structured analysis data
-│   ├── searched/           # Raw scraped articles
-│   │   ├── article_1.md
-│   │   └── article_2.md
-│   └── filtered/           # Filtered articles
-│       ├── filtered_1.md
-│       ├── filtered_2.md
-│       └── filtered_articles_index.csv
-└── AAPL/                   # Another ticker
-    └── ...
-```
-
-## API Endpoints
-
-### Core Endpoints
-- `GET /` - Basic health check
-- `GET /health` - Detailed health check with Docker status
-- `POST /run` - Start a new stock analysis job with customizable parameters
-- `GET /jobs` - List all jobs
-- `GET /jobs/{job_id}` - Get job status and results
-- `GET /jobs/{job_id}/status/detailed` - Get detailed job status with progress metrics
-
-### Real-time Monitoring
-- `GET /jobs/{job_id}/logs` - Get detailed job logs for debugging
-- `GET /jobs/{job_id}/logs/stream` - Stream real-time job logs (Server-Sent Events)
-- `GET /jobs/{job_id}/info-log` - Get the complete info.log file content
-- `GET /jobs/{job_id}/files/{filename}` - Download output files (info.log, screening_report.md, etc.)
-
-### Download Endpoints
-- `GET /jobs/{job_id}/download/searched-articles` - Download scraped articles as ZIP
-- `GET /jobs/{job_id}/download/filtered-articles` - Download filtered articles as ZIP
-- `GET /jobs/{job_id}/download/screening-report` - Download LLM analysis report
-- `GET /jobs/{job_id}/download/all-results` - Download complete analysis results as ZIP
-- `GET /jobs/{job_id}/files` - List available files and counts for a job
-
-### Job Parameters
-
-When starting a new analysis job via `POST /run`, you can customize the analysis with these parameters:
-
-**Required:**
-- `ticker` (string): Stock ticker symbol (e.g., "NVDA", "AAPL", "TSLA")
-
-**Optional:**
-- `company` (string): Company name (if not provided, will be inferred from ticker)
-- `query` (string): Custom search query for finding articles
-- `pipeline` (string): Analysis pipeline type:
-  - `"full"` - Complete analysis (scrape → filter → LLM analysis)
-  - `"scrape-only"` - Only scrape articles
-  - `"filter-only"` - Scrape and filter articles
-  - `"screen-only"` - Only run LLM analysis on existing data
-  - `"filter-screen"` - Filter and run LLM analysis
-
-**Advanced Configuration:**
-- `max_searched` (integer): Maximum articles to scrape (default: 20)
-- `min_score` (float): Minimum relevance score for filtering (default: 3.0)
-- `max_filtered` (integer): Maximum filtered articles to keep (default: 10)
-- `min_confidence` (float): Minimum confidence for LLM insights (default: 0.5)
-
-### Example Usage
-
-Start a basic job:
-```bash
-curl -X POST "http://localhost:8080/run" \
+# 1. Request a code
+curl -X POST http://localhost:8080/auth/request-code \
   -H "Content-Type: application/json" \
-  -d '{"ticker": "NVDA", "company": "NVIDIA Corporation", "pipeline": "full"}'
-```
+  -d '{"email": "user@example.com"}'
 
-Start a customized job with advanced parameters:
-```bash
-curl -X POST "http://localhost:8080/run" \
+# 2. Verify the code
+curl -X POST http://localhost:8080/auth/verify-code \
   -H "Content-Type: application/json" \
-  -d '{
-    "ticker": "AAPL",
-    "company": "Apple Inc",
-    "pipeline": "full",
-    "max_searched": 30,
-    "min_score": 4.0,
-    "max_filtered": 15,
-    "min_confidence": 0.7,
-    "query": "Apple iPhone sales Q4 earnings"
-  }'
+  -d '{"email": "user@example.com", "code": "246810"}'
 ```
 
-Start a scrape-only job for data collection:
+#### Session Management
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/auth/session/me` | Get current authenticated user info |
+| `POST` | `/auth/logout` | Clear session and log out |
+
+---
+
+### Analysis Jobs
+
+#### Start Analysis
+
+```
+POST /run
+```
+
+Launch a new stock analysis job in an isolated Docker container.
+
+**Request Body:**
+```json
+{
+  "ticker": "NVDA",
+  "company": "NVIDIA Corporation",
+  "email": "user@example.com",
+  "llm": "gpt-4o-mini",
+  "pipeline": "comprehensive",
+  "query": "NVIDIA earnings and AI chip demand"
+}
+```
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `ticker` | string | ✅ | — | Stock ticker symbol (e.g., `NVDA`, `AAPL`) |
+| `company` | string | ✅ | — | Company name |
+| `email` | string | ✅ | — | User email (used for data path organization) |
+| `llm` | string | ❌ | `gpt-4o-mini` | LLM model to use for analysis |
+| `pipeline` | string | ❌ | `comprehensive` | Pipeline type (see table below) |
+| `query` | string | ❌ | — | Custom search query for news-related pipelines |
+
+**Available Pipelines:**
+
+| Pipeline | Description |
+|---|---|
+| `comprehensive` | Full end-to-end: scraping → filtering → LLM analysis → financial modeling → report generation |
+| `financial-only` | Financial data scraping and DCF modeling only |
+| `model-only` | Financial model generation from existing scraped data |
+| `news-only` | News scraping and article analysis only |
+| `model-to-price` | Financial model to price target derivation |
+| `news-to-price` | News sentiment to price impact analysis |
+
+**Response:**
+```json
+{
+  "job_id": "NVDA_20260220_143022",
+  "ticker": "NVDA",
+  "status": "pending",
+  "message": "Analysis job started"
+}
+```
+
+#### Stop Analysis
+
+```
+POST /jobs/{job_id}/stop
+```
+
+Gracefully stop a running job. Sends SIGTERM with a 10-second timeout, then force-kills if necessary.
+
+#### Job Status Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/jobs/{job_id}` | Basic job status |
+| `GET` | `/jobs/{job_id}/status/detailed` | Full status with file availability, logs count, and latest log |
+| `GET` | `/jobs` | List all jobs |
+| `GET` | `/jobs/{job_id}/logs` | Snapshot of recent logs |
+
+**Job Status Values:**
+
+| Status | Description | Retryable? |
+|---|---|---|
+| `pending` | Job queued, waiting to start | — |
+| `running` | Analysis actively executing in container | — |
+| `completed` | Successfully finished with all results available | — |
+| `failed` | Analysis failed — check `error` field for details | ✅ |
+| `llm_timeout` | LLM analysis timed out (provider overloaded) | ✅ |
+| `stopping` | Stop request received, shutting down container | — |
+| `stopped` | Successfully stopped by user | ✅ |
+
+---
+
+### Chat Pipeline
+
+```
+POST /chat
+```
+
+Start an interactive AI chat session. The backend identifies the relevant ticker from the user's natural language, then runs a targeted analysis pipeline.
+
+**Request Body:**
+```json
+{
+  "email": "user@example.com",
+  "timestamp": "2026-02-20T14:30:00",
+  "user_prompt": "What's happening with NVIDIA's AI chip business?",
+  "session_id": "optional-session-id-for-continuity"
+}
+```
+
+The `ticker` field in the response starts as `"pending"` and updates to the identified symbol (e.g., `NVDA`) once the backend extracts it. Use SSE streaming (`/jobs/{job_id}/logs/stream`) to receive the identified ticker and NL-type log messages in real time.
+
+---
+
+### Real-time Stock Prices
+
+All endpoints are prefixed with `/api/realtime`.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/realtime/health` | Service health check with connection stats |
+| `GET` | `/api/realtime/status` | Detailed service statistics |
+| `GET` | `/api/realtime/price/{symbol}` | Current price for one symbol |
+| `POST` | `/api/realtime/prices` | Batch prices for multiple symbols (max 50) |
+| `GET` | `/api/realtime/historical/{symbol}?timeframe=1M` | Historical OHLCV data |
+| `GET` | `/api/realtime/subscriptions` | Active WebSocket subscriptions |
+| `POST` | `/api/realtime/subscribe/{symbol}` | Manually subscribe to price updates |
+| `DELETE` | `/api/realtime/subscribe/{symbol}` | Unsubscribe from a symbol |
+| `GET` | `/api/realtime/market/status` | US market open/closed status |
+| `GET` | `/api/realtime/config` | Current fetcher configuration |
+| `POST` | `/api/realtime/config` | Update fetcher configuration |
+| `POST` | `/api/realtime/test/yfinance` | Test yfinance API connectivity |
+| `GET` | `/api/realtime/debug/cache` | Inspect price cache (debug) |
+| `WS` | `/api/realtime/ws` | **WebSocket** for real-time price streaming |
+
+**Valid Historical Timeframes:** `1D` · `1W` · `1M` · `3M` · `1Y` · `ALL`
+
+**Example — Get Stock Price:**
 ```bash
-curl -X POST "http://localhost:8080/run" \
+curl http://localhost:8080/api/realtime/price/AAPL
+```
+```json
+{
+  "symbol": "AAPL",
+  "name": "Apple Inc.",
+  "current_price": 187.45,
+  "previous_close": 185.92,
+  "change_amount": 1.53,
+  "change_percent": 0.82,
+  "volume": 54230100,
+  "market_cap": 2890000000000,
+  "pe_ratio": 29.4,
+  "sector": "Technology",
+  "industry": "Consumer Electronics",
+  "high_52w": 199.62,
+  "low_52w": 164.08,
+  "bid": 187.44,
+  "ask": 187.46,
+  "is_market_open": true
+}
+```
+
+---
+
+### News Feed System
+
+All endpoints are prefixed with `/api/news`.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/news/feed` | Fetch news articles for specified tickers |
+| `GET` | `/api/news/status/{ticker}` | Check news data availability for a ticker |
+| `GET` | `/api/news/jobs` | List active backend news search jobs |
+| `GET` | `/api/news/jobs/{job_id}` | Get specific search job status |
+| `POST` | `/api/news/refresh/{ticker}` | Force refresh news from backend |
+| `GET` | `/api/news/auto-updater/status` | Background auto-updater status |
+| `GET` | `/api/news/debug/{ticker}` | Debug: inspect raw database documents |
+| `WS` | `/api/news/ws` | **WebSocket** for real-time news streaming |
+
+**Example — Fetch News:**
+```bash
+curl -X POST http://localhost:8080/api/news/feed \
   -H "Content-Type: application/json" \
-  -d '{"ticker": "TSLA", "pipeline": "scrape-only", "max_searched": 50}'
+  -d '{"tickers": ["NVDA", "AAPL"], "limit": 10, "days_back": 7}'
 ```
 
-Stream real-time logs:
+---
+
+### Daily Intelligence Reports
+
+All endpoints are prefixed with `/api/daily-reports`.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/daily-reports/health` | Service health |
+| `POST` | `/api/daily-reports/generate/company` | Generate company reports (batch) |
+| `POST` | `/api/daily-reports/generate/sector` | Generate sector reports (batch) |
+| `GET` | `/api/daily-reports/jobs/{job_id}/status` | Individual job status |
+| `GET` | `/api/daily-reports/batch/{batch_id}/status` | Batch status (aggregated) |
+| `GET` | `/api/daily-reports/jobs/{job_id}/logs` | Job container logs (debug) |
+| `GET` | `/api/daily-reports/available-reports` | List all generated reports |
+| `GET` | `/api/daily-reports/company/{ticker}/markdown?timestamp=YYYY-MM-DD` | Get report as markdown |
+| `GET` | `/api/daily-reports/company/{ticker}/pdf?timestamp=YYYY-MM-DD` | Download report as PDF |
+| `POST` | `/api/daily-reports/companies/markdown` | Batch: multiple company reports |
+| `GET` | `/api/daily-reports/sector/{sector}/markdown?timestamp=YYYY-MM-DD` | Get sector report |
+| `GET` | `/api/daily-reports/sector/{sector}/pdf?timestamp=YYYY-MM-DD` | Download sector PDF |
+| `POST` | `/api/daily-reports/sectors/markdown` | Batch: multiple sector reports |
+| `GET` | `/api/daily-reports/scheduler/status` | Scheduler status & next trigger |
+
+**Example — Generate Company Reports:**
 ```bash
-curl -N "http://localhost:8080/jobs/NVDA_20250803_163401/logs/stream"
+curl -X POST http://localhost:8080/api/daily-reports/generate/company \
+  -H "Content-Type: application/json" \
+  -d '{"tickers": ["AAPL", "MSFT", "GOOGL"], "timestamp": "2026-02-20"}'
+```
+```json
+{
+  "batch_id": "company_batch_2026-02-20_143022",
+  "total_jobs": 3,
+  "job_ids": [
+    "company_report_AAPL_2026-02-20",
+    "company_report_MSFT_2026-02-20",
+    "company_report_GOOGL_2026-02-20"
+  ],
+  "status": "pending",
+  "tickers_or_sectors": ["AAPL", "MSFT", "GOOGL"],
+  "report_type": "company"
+}
 ```
 
-Get job status:
+---
+
+### File Downloads
+
+After a job completes, download generated artifacts:
+
+| Method | Endpoint | Output |
+|---|---|---|
+| `GET` | `/jobs/{job_id}/download/financial-model` | Excel financial model (`.xlsx`) |
+| `GET` | `/jobs/{job_id}/download/professional-report` | Professional analysis report (`.pdf`) |
+| `GET` | `/jobs/{job_id}/download/financial-summary` | Financial summary (`.pdf`) |
+| `GET` | `/jobs/{job_id}/download/news-summary` | News summary (`.pdf`) |
+| `GET` | `/jobs/{job_id}/download/all-results` | Complete archive (`.tar`) |
+| `GET` | `/jobs/{job_id}/files` | List available files (JSON) |
+
+---
+
+### Health & Monitoring
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/` | Root status check |
+| `GET` | `/health` | Comprehensive: Docker, realtime, news, API keys |
+| `GET` | `/healthz` | Kubernetes-style liveness probe |
+
+**Example:**
 ```bash
-curl "http://localhost:8080/jobs/NVDA_20250803_163401" | jq .
+curl http://localhost:8080/health | python -m json.tool
 ```
-
-## Key Features
-
-### Advanced Job Customization
-The API now supports fine-grained control over analysis jobs with parameters for:
-- **Pipeline Selection**: Choose specific analysis stages (scrape-only, filter-only, full, etc.)
-- **Article Limits**: Control maximum articles scraped and filtered
-- **Quality Thresholds**: Set minimum relevance scores and confidence levels
-- **Custom Queries**: Use specific search terms for targeted article discovery
-
-### Real-time Log Streaming
-The API supports real-time streaming of container logs using Server-Sent Events (SSE). This allows frontends to:
-- Monitor job progress in real-time
-- Display live log updates
-- Detect completion status immediately
-- Handle errors and warnings as they occur
-
-### LLM Timeout Handling
-The API now intelligently handles LLM analysis timeouts:
-- **Smart Status Detection**: Distinguishes between LLM timeouts and actual failures
-- **Frontend Friendly**: `llm_timeout` status allows frontend to show retry options instead of complete failure
-- **Progress Preservation**: Shows 75% progress when LLM timeout occurs (reached analysis stage)
-- **Actionable Messages**: Provides clear "retrying may help" guidance to users
-
-### Comprehensive Download Options
-Multiple download formats for analysis results:
-- Individual file downloads (logs, reports, data)
-- Organized ZIP packages for article collections
-- Complete analysis packages with all results
-
-## Job Status Types
-
-The API returns different status values to help frontends handle various scenarios:
-
-- **`pending`** - Job is queued and waiting to start
-- **`running`** - Job is actively running
-- **`completed`** - Job finished successfully with results
-- **`failed`** - Job failed due to configuration issues, data errors, etc.
-- **`llm_timeout`** - Job timed out during LLM analysis phase (retryable)
-
-## Troubleshooting
-
-### Docker-Related Issues
-
-**Issue: "Docker client not available" error**
-```bash
-# Check Docker daemon status
-docker --version
-docker ps
-
-# Ensure Docker socket is accessible
-ls -la /var/run/docker.sock
-
-# If using Docker Desktop on macOS, ensure it's running
-```
-
-**Issue: "stock-analyst:latest" image not found**
-```bash
-# Check available images
-docker images | grep stock-analyst
-
-# If missing, you need to build or obtain the backend analysis image
-# This is a separate repository containing the actual stock analysis pipeline
-```
-
-**Issue: Volume permission errors**
-```bash
-# Recreate the data volume
-docker volume rm stockdata
-docker volume create stockdata
-
-# Check volume details
-docker volume inspect stockdata
-```
-
-**Issue: Container fails to start analysis jobs**
-```bash
-# Check API runner logs
-docker logs api-runner
-
-# Verify environment variables are loaded
-docker exec api-runner env | grep -E "(SERPAPI|OPENAI)"
-
-# Test Docker-in-Docker functionality
-docker exec api-runner docker ps
-```
-
-**Issue: Port already in use**
-```bash
-# Find what's using port 8080
-lsof -i :8080
-
-# Kill existing processes
-pkill -f "python.*main.py"
-
-# Or use different port
-docker run -p 8081:8080 ... stock-analyst-runner
-```
-
-**Issue: Analysis results not persisting**
-```bash
-# Verify volume mount
-docker inspect api-runner | grep -A 5 "Mounts"
-
-# Check volume contents
-docker run --rm -v stockdata:/data alpine ls -la /data/
-
-# Verify backend containers can write to volume
-docker run --rm -v stockdata:/data alpine touch /data/test.txt
-```
-
-### Development and Debugging
-
-**View real-time logs:**
-```bash
-# API Runner logs
-docker logs -f api-runner
-
-# Or with Docker Compose
-docker-compose logs -f api-runner
-
-# Analysis job logs (when available)
-curl "http://localhost:8080/jobs/NVDA_20250809_221954/logs/stream"
-```
-
-**Access container shell:**
-```bash
-# Access API runner container
-docker exec -it api-runner bash
-
-# Inspect data volume contents
-docker run --rm -it -v stockdata:/data alpine sh
-ls -la /data/
-```
-
-**Clean slate restart:**
-```bash
-# Stop all containers and clean up
-docker-compose down
-docker stop api-runner 2>/dev/null && docker rm api-runner 2>/dev/null
-
-# Remove old images (optional)
-docker rmi stock-analyst-runner 2>/dev/null
-
-# Remove data volume (WARNING: deletes all analysis results)
-docker volume rm stockdata 2>/dev/null
-
-# Start fresh
-docker volume create stockdata
-docker-compose up --build
-```
-
-### Common Issues
-
-**LLM Timeouts**: If you encounter `llm_timeout` status, this usually means:
-- The LLM API is experiencing high load
-- The analysis is processing a large number of articles
-- Network connectivity issues to the LLM provider
-
-**Solution**: Retry the job or reduce `max_filtered` parameter to process fewer articles.
-
-**Empty Results**: If jobs complete but produce no articles:
-- Check if the company name and ticker are correct
-- Try a more specific `query` parameter
-- Lower the `min_score` threshold for filtering
-
-**Container Issues**: If jobs fail immediately:
-- Ensure Docker is running and accessible
-- Check that the `stock-analyst:latest` backend image exists
-- Verify API keys are properly configured
-
-## Environment Variables
-
-### Required Configuration
-- `SERPAPI_API_KEY`: **Required** - API key for SerpApi web search service
-  - Get from: https://serpapi.com/
-  - Used by backend analysis containers for web scraping
-  
-- `OPENAI_API_KEY`: **Required** - API key for OpenAI GPT models  
-  - Get from: https://platform.openai.com/api-keys
-  - Used by backend analysis containers for LLM analysis
-
-### Docker Configuration
-- `BACKEND_IMAGE`: Docker image for analysis jobs (default: `stock-analyst:latest`)
-  - This should be the Docker image containing the stock analysis pipeline
-  - Must be available locally or in a accessible registry
-  
-- `DATA_VOLUME`: Docker volume name for persistent data (default: `stockdata`)
-  - Volume where analysis results are stored
-  - Shared between API runner and backend analysis containers
-
-### Example .env File
-```bash
-# Required API Keys
-SERPAPI_API_KEY=your_serpapi_key_here
-OPENAI_API_KEY=sk-your_openai_key_here
-
-# Optional Docker Configuration
-BACKEND_IMAGE=stock-analyst:latest
-DATA_VOLUME=stockdata
-```
-
-### Configuration Validation
-
-Check if your configuration is correct:
-```bash
-# Test API runner health
-curl http://localhost:8080/health
-
-# Expected response:
+```json
 {
   "status": "healthy",
   "docker": "connected",
-  "backend_image": "stock-analyst:latest", 
+  "realtime_prices": "running",
+  "websocket_server": "integrated",
+  "news_feed": "running",
+  "backend_image": "stock-analyst:latest",
   "data_volume": "stockdata",
   "api_keys_configured": {
     "serpapi": true,
-    "openai": true
+    "openai": true,
+    "anthropic": true
   }
 }
 ```
 
-## Quick Reference
+---
 
-### Essential Docker Commands
+## Real-time Log Streaming (SSE)
 
-```bash
-# Initial setup (run once)
-docker volume create stockdata
-cp .env.example .env  # Edit with your API keys
-
-# Daily development workflow
-docker stop api-runner && docker rm api-runner          # Stop current
-docker build -t stock-analyst-runner .                  # Rebuild 
-docker run -d -p 8080:8080 \                           # Start fresh
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v stockdata:/data \
-  --env-file .env --name api-runner stock-analyst-runner
-
-# Check status
-curl http://localhost:8080/health                       # API health
-docker logs api-runner                                  # View logs
-docker exec api-runner docker ps                       # Test Docker access
+```
+GET /jobs/{job_id}/logs/stream
 ```
 
-### Analysis Job Workflow
+Server-Sent Events stream for live monitoring of analysis progress. Features automatic heartbeats, final drain logic, and session ID extraction for chat jobs.
 
-```bash
-# Start analysis
-curl -X POST http://localhost:8080/run \
-  -H "Content-Type: application/json" \
-  -d '{"ticker": "NVDA", "pipeline": "full"}'
+**Event Types:**
 
-# Monitor progress  
-curl http://localhost:8080/jobs/NVDA_20250809_221954
-curl -N http://localhost:8080/jobs/NVDA_20250809_221954/logs/stream
+| Event | Description |
+|---|---|
+| `connection` | Initial connection established |
+| `log` | Log line — includes `type` field: `"NL"` (LLM natural language) or `"LOG"` (system log) |
+| `status` | Progress status update |
+| `completed` | Analysis finished (may include `session_id` for chat pipelines) |
+| `error` | Error occurred |
 
-# Download results
-curl http://localhost:8080/jobs/NVDA_20250809_221954/download/screening-report \
-  -o nvda_report.md
+**Frontend Integration Example:**
+```javascript
+const eventSource = new EventSource(`/jobs/${jobId}/logs/stream`);
+
+eventSource.addEventListener('log', (event) => {
+  const data = JSON.parse(event.data);
+  if (data.type === 'NL') {
+    // LLM-generated natural language output
+    appendToChat(data.message);
+  } else {
+    // System log message
+    appendToLog(data.message);
+  }
+});
+
+eventSource.addEventListener('completed', (event) => {
+  const data = JSON.parse(event.data);
+  console.log('Done!', data.session_id);
+  eventSource.close();
+});
 ```
 
-### Data Volume Management
+---
+
+## WebSocket Protocols
+
+### Stock Price WebSocket — `/api/realtime/ws`
+
+**Subscribe:**
+```json
+{ "type": "subscribe", "symbols": ["AAPL", "GOOGL", "MSFT"], "user_id": "user@example.com" }
+```
+
+**Price Update (received every ~10s for subscribed symbols):**
+```json
+{
+  "type": "price_update",
+  "data": {
+    "symbol": "AAPL",
+    "name": "Apple Inc.",
+    "current_price": 187.45,
+    "change_amount": 1.53,
+    "change_percent": 0.82,
+    "volume": 54230100,
+    "sector": "Technology",
+    "industry": "Consumer Electronics",
+    "bid": 187.44,
+    "ask": 187.46,
+    "high_52w": 199.62,
+    "low_52w": 164.08,
+    "timestamp": "2026-02-20T14:30:22"
+  }
+}
+```
+
+**Supported Messages:** `subscribe` · `unsubscribe` · `ping` · `get_price`
+
+### News Feed WebSocket — `/api/news/ws`
+
+**Subscribe:**
+```json
+{
+  "type": "subscribe",
+  "tickers": ["NVDA", "AAPL"],
+  "limit": 20,
+  "days_back": 7,
+  "force_refresh": false
+}
+```
+
+**Article Update:**
+```json
+{
+  "type": "news_update",
+  "data": {
+    "ticker": "NVDA",
+    "article": {
+      "title": "NVIDIA Reports Record Revenue...",
+      "content": "Full article text...",
+      "source_url": "https://reuters.com/...",
+      "publish_date": "Feb 19, 2026",
+      "serpapi_source": "Reuters"
+    },
+    "source": "cache"
+  }
+}
+```
+
+**Supported Messages:** `subscribe` · `unsubscribe` · `ping` · `refresh`
+
+---
+
+## Data Architecture
+
+### Volume Layout
+
+All analysis data is persisted in the `stockdata` Docker volume:
+
+```
+/data/
+├── user@example.com/                           # Per-user namespace
+│   ├── NVDA/
+│   │   └── 2026-02-20T14:30:22.123456/        # Per-run timestamp
+│   │       ├── info.log                         # Complete pipeline execution log
+│   │       ├── models/
+│   │       │   ├── NVDA_financial_model.xlsx    # DCF/comparable Excel model
+│   │       │   └── NVDA_price_adjustment_explanation.md
+│   │       ├── reports/
+│   │       │   └── NVDA_Professional_Analysis_Report.md
+│   │       ├── summaries/
+│   │       │   ├── NVDA_financial_summary.md
+│   │       │   └── NVDA_news_summary.md
+│   │       ├── searched/                        # Raw scraped articles (.md)
+│   │       └── filtered/                        # NLP-filtered articles + index.csv
+│   └── AAPL/
+│       └── ...
+│
+└── reports@vynnai.com/                          # Daily intelligence reports
+    ├── AAPL/
+    │   └── 2026-02-20/reports/*.md
+    ├── TECHNOLOGY/                               # Sector-level reports
+    │   └── 2026-02-20/reports/*.md
+    └── COMMUNICATION_SERVICES/
+        └── ...
+```
+
+### MongoDB Collections
+
+News articles are stored via `vynn_core` in per-ticker collections:
+
+| Collection | Document Schema |
+|---|---|
+| `NVDA`, `AAPL`, etc. | `{ urlHash, title, content, company, ticker, source_url, publish_date, scraped_at, search_category, serpapi_source, serpapi_snippet, serpapi_thumbnail, serpapi_authors, serpapi_source_icon, word_count, createdAt, updatedAt }` |
+
+---
+
+## Troubleshooting
+
+### Docker Issues
+
+| Problem | Diagnosis | Solution |
+|---|---|---|
+| Docker client not available | `docker ps` fails | Start Docker Desktop or Docker daemon |
+| Backend image not found | `docker images \| grep stock-analyst` returns nothing | Build or pull the `stock-analyst:latest` image |
+| Permission denied on socket | API can't spawn containers | `chmod 666 /var/run/docker.sock` or add user to `docker` group |
+| Volume permission errors | Files not readable | `docker volume rm stockdata && docker volume create stockdata` |
+| Port 8080 in use | `lsof -i :8080` | Kill conflicting process or remap port: `-p 8081:8080` |
+
+### Job Failures
+
+| Status | Meaning | Action |
+|---|---|---|
+| `llm_timeout` | LLM provider is slow/overloaded | Retry — often succeeds on second attempt |
+| `failed` (exit code ≠ 0) | Backend container crashed | Check `GET /jobs/{id}/logs` for container error output |
+| Empty results | No articles found | Verify ticker/company, use specific `query`, lower score thresholds |
+
+### Useful Debug Commands
 
 ```bash
-# Inspect volume contents
-docker run --rm -v stockdata:/data alpine ls -la /data/
+# API health check
+curl http://localhost:8080/health | python -m json.tool
 
-# Backup analysis results
+# View API Runner container logs
+docker logs -f api-runner
+
+# Inspect data volume contents
+docker run --rm -v stockdata:/data alpine ls -laR /data/
+
+# Check environment variables are loaded
+docker exec api-runner env | grep -E "(SERPAPI|OPENAI|ANTHROPIC|MONGO)"
+
+# Access container shell for debugging
+docker exec -it api-runner bash
+
+# Backup all analysis results
 docker run --rm -v stockdata:/data -v $(pwd):/backup alpine \
   tar czf /backup/stockdata_backup.tar.gz -C /data .
 
 # Restore from backup
 docker run --rm -v stockdata:/data -v $(pwd):/backup alpine \
   tar xzf /backup/stockdata_backup.tar.gz -C /data
+
+# Full clean-slate restart
+docker compose down
+docker volume rm stockdata
+docker volume create stockdata
+docker compose up --build -d
 ```
+
+---
+
+## License
+
+This project is proprietary software. All rights reserved.
