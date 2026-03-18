@@ -1,4 +1,8 @@
-# 📈 Stock Analyst API Runner
+<div align="center">
+
+<img src="assets/vynnai-logo.jpg" alt="VYNN AI logo" width="200">
+
+# 📈 VYNN AI API Runner
 
 > **A high-performance FastAPI orchestration service for AI-powered stock analysis, real-time market data streaming, and automated intelligence report generation.**
 
@@ -16,6 +20,8 @@
 | **Total Lines of Code** | 10,598 |
 | **Python Source Lines** | 8,764 |
 | **Source Files** | 30 |
+
+</div>
 
 ---
 
@@ -49,7 +55,7 @@
 
 ## Overview
 
-The **Stock Analyst API Runner** is a production-grade orchestration layer that manages the full lifecycle of AI-driven stock analysis workflows. It acts as the central control plane — receiving analysis requests, spinning up isolated Docker containers for each pipeline run, streaming real-time progress back to clients, and delivering structured outputs (PDF reports, Excel financial models, markdown summaries).
+The **VYNN AI API Runner** is a production-grade orchestration layer that manages the full lifecycle of AI-driven stock analysis workflows. It acts as the central control plane — receiving analysis requests, spinning up isolated Docker containers for each pipeline run, streaming real-time progress back to clients, and delivering structured outputs (PDF reports, Excel financial models, markdown summaries).
 
 ### What It Does
 
