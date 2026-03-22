@@ -11,17 +11,8 @@
 [![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED.svg)](https://www.docker.com/)
 [![MongoDB](https://img.shields.io/badge/MongoDB-Async-47A248.svg)](https://www.mongodb.com/)
 [![WebSocket](https://img.shields.io/badge/WebSocket-Real--time-FF6F00.svg)](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket)
-[![Lines of Code](https://img.shields.io/badge/Lines%20of%20Code-10.6k-brightgreen.svg)](#)
 
 </div>
-
-### 📊 Codebase Stats
-
-| Metric | Count |
-|--------|-------|
-| **Total Lines of Code** | 10,598 |
-| **Python Source Lines** | 8,764 |
-| **Source Files** | 30 |
 
 ---
 
