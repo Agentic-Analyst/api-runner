@@ -9,8 +9,8 @@
 [![Python 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104-009688.svg)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED.svg)](https://www.docker.com/)
-[![MongoDB](https://img.shields.io/badge/MongoDB-Async-47A248.svg)](https://www.mongodb.com/)
 [![WebSocket](https://img.shields.io/badge/WebSocket-Real--time-FF6F00.svg)](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Agentic-Analyst/api-runner)
 
 </div>
 
